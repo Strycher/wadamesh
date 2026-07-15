@@ -1,0 +1,55 @@
+name: CI
+
+# Build-checks every PR to main (and main itself) across all firmware envs.
+# Mirrors the release.yml build recipe (setup-python 3.12 + PlatformIO + cache).
+# No secrets required: scripts/inject_wifi_env.py falls back to placeholder
+# credentials when WIFI_SSID/WIFI_PWD are unset.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Guard: inert if this file ever rides an upstream-bound branch.
+    if: github.repository == 'Strycher/wadamesh'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pio_env:
+          - heltec_v4_tft_companion_radio_usb_tcp_touch
+          - heltec_v4_r8_tft_companion_radio_usb_tcp_touch
+          - LilyGo_TDeck_companion_radio_touch
+          - ThinkNode_M9_companion_radio_touch
+          - rak_tap_v2_companion_radio_touch
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            .pio
+          key: pio-ci-${{ runner.os }}-${{ matrix.pio_env }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build ${{ matrix.pio_env }}
+        run: pio run -e ${{ matrix.pio_env }}
