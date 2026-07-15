@@ -1,5 +1,5 @@
 # Auto-promote dependencies: when an issue closes, check if blocked
-# issues now have all dependencies resolved and label them beads:ready.
+# issues now have all dependencies resolved and label them board:ready.
 #
 # Trigger: issue closed + 4-hour cron fallback sweep
 # API: REST only (no GraphQL / gh project)
@@ -70,29 +70,15 @@ jobs:
 
               const allResolved = deps.every(d => closedNumbers.has(d));
               const labels = issue.labels.map(l => l.name);
-              const hasReady = labels.includes('beads:ready');
-              const hasBlocked = labels.includes('beads:blocked');
+              const hasReady = labels.includes('board:ready');
 
               if (allResolved && !hasReady) {
-                // Add beads:ready label
+                // Promote: Todo -> Ready (sync-labels-to-board.yml moves the board)
                 await github.rest.issues.addLabels({
                   owner, repo,
                   issue_number: issue.number,
-                  labels: ['beads:ready'],
+                  labels: ['board:ready'],
                 });
-
-                // Remove beads:blocked if present
-                if (hasBlocked) {
-                  try {
-                    await github.rest.issues.removeLabel({
-                      owner, repo,
-                      issue_number: issue.number,
-                      name: 'beads:blocked',
-                    });
-                  } catch (e) {
-                    // Label might not exist
-                  }
-                }
 
                 // Add comment
                 const depList = deps.map(d => `#${d}`).join(', ');
@@ -104,17 +90,6 @@ jobs:
 
                 console.log(`Promoted #${issue.number}: ${issue.title}`);
                 promoted++;
-              } else if (!allResolved && !hasBlocked) {
-                const pending = deps.filter(d => !closedNumbers.has(d));
-                // Optionally add beads:blocked label
-                await github.rest.issues.addLabels({
-                  owner, repo,
-                  issue_number: issue.number,
-                  labels: ['beads:blocked'],
-                });
-                console.log(
-                  `Blocked #${issue.number}: waiting on ${pending.map(d => '#' + d).join(', ')}`
-                );
               }
             }
 
