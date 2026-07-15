@@ -99,6 +99,8 @@
   #include "qr_icon.h"        // baked recolour-able QR glyph (qr_icon_dsc) for the Chats Share button
   #if defined(HAS_TANMATSU)
     #include <TanmatsuDisplay.h>             // badge-bsp-backed DisplayDriver (P4)
+  #elif defined(HAS_CROWPANEL7)
+    #include <CrowPanel7Display.h>           // EK79007 MIPI-DSI DisplayDriver (P4)
   #else
     #include <helpers/ui/ST7789LCDDisplay.h>
   #endif
@@ -127,6 +129,8 @@
   #endif
   #if defined(HAS_TANMATSU)
     extern TanmatsuDisplay display;
+  #elif defined(HAS_CROWPANEL7)
+    extern CrowPanel7Display display;
   #else
     extern ST7789LCDDisplay display;
   #endif
@@ -29009,7 +29013,9 @@ static void powerOffCb(lv_event_t* e) {
   // Let the toast paint, then enter deep sleep.
   lv_refr_now(NULL);
   delay(900);
-#if defined(PIN_USER_BTN)
+#if defined(PIN_USER_BTN) && (PIN_USER_BTN >= 0)
+  // (>= 0: boards with no wake button — CrowPanel7 sets -1 — skip the ext0 setup
+  //  entirely; the P4 also lacks ext0 wakeup, so this block must compile out there.)
   const gpio_num_t wake = (gpio_num_t)PIN_USER_BTN;   // GPIO0, trackball click, active-low
   // CRITICAL: the trackball button is held HIGH by a pull-up while idle and
   // pulled LOW only when pressed. Across deep sleep the normal GPIO pull is
@@ -29029,8 +29035,8 @@ static void powerOffCb(lv_event_t* e) {
 }
 
 #if defined(ESP32)
-#if !defined(HAS_TANMATSU)
-#include "soc/rtc_cntl_reg.h"   // RTC_CNTL_FORCE_DOWNLOAD_BOOT (header-guarded)
+#if !defined(CONFIG_IDF_TARGET_ESP32P4)
+#include "soc/rtc_cntl_reg.h"   // RTC_CNTL_FORCE_DOWNLOAD_BOOT (S3-only; no P4 has it)
 #endif
 // Force the ROM serial bootloader (USB download / flash mode) on the next reset,
 // so the device can be reflashed over USB without holding BOOT + tapping RST. The
@@ -29038,7 +29044,7 @@ static void powerOffCb(lv_event_t* e) {
 // esptool's post-flash reset — or a power cycle — clears it back to a normal boot.
 // (Tanmatsu/P4 has no RTC_CNTL_OPTION1_REG and the launcher manages flashing — plain restart.)
 static void rebootToDownloadMode() {
-#if !defined(HAS_TANMATSU)
+#if !defined(CONFIG_IDF_TARGET_ESP32P4)
   REG_SET_BIT(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
 #endif
   ESP.restart();

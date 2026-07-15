@@ -34,3 +34,10 @@ CLAUDE.md
 
 # Local reconstruction notes (scratch, never publish)
 /.notes/
+
+# --- ESP-IDF hybrid build artifacts (crowpanel7 env, #11) — all derived ---
+/CMakeLists.txt
+/src/CMakeLists.txt
+/dependencies.lock
+/managed_components/
+/sdkconfig.crowpanel7_companion_radio_touch
