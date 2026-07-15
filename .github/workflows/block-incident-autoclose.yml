@@ -41,6 +41,8 @@ permissions:
 
 jobs:
   check-pr-body:
+    # Fork-local guard: inert if this file ever rides an upstream-bound branch
+    if: github.repository == 'Strycher/wadamesh'
     runs-on: ubuntu-latest
     steps:
       - name: Extract Closes/Fixes/Resolves keywords + check labels
