@@ -1,0 +1,127 @@
+# =============================================================================
+# Block PR auto-close of type:incident GH issues (standards#106, server side)
+# =============================================================================
+# Companion to the canonical pre-push hook (standards#100). The pre-push catches
+# `Closes/Fixes/Resolves #N` in commit messages; this workflow catches the same
+# pattern in PR bodies (which are created/edited via `gh pr create --body` AFTER
+# the push, so pre-push never sees them).
+#
+# Together they form two-layer defense:
+#   - client-side (pre-push hook): commit-message variant, cheap, bypassable
+#   - server-side (this workflow): PR-body variant, runs in GH infrastructure,
+#     not bypassable by the agent; the human can rewrite the PR body or remove
+#     the type:incident label from the issue to clear the block
+#
+# Why incidents need this: incident closure is a human-judgment gate (root cause
+# + immediate fix + defense in depth + follow-ups tracked + post-incident
+# write-up), not a side effect of one PR merging. The original incident this
+# was filed against (citadel#70) auto-closed via PR-body `Closes #70` before
+# the user was aware. See standards#100 for the broader rationale.
+#
+# To install in another DW project:
+#   cp standards/.github/workflows/block-incident-autoclose.yml \
+#      <project>/.github/workflows/
+#   commit + merge
+#
+# Make this a required status check in branch protection if you want the gate
+# to actually block merge in that project. Otherwise it surfaces as a failing
+# check that humans can choose to acknowledge or address.
+# =============================================================================
+
+name: block-incident-autoclose
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write   # to post the explanation comment
+  issues: read           # to query labels on referenced issues
+
+jobs:
+  check-pr-body:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract Closes/Fixes/Resolves keywords + check labels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+
+          # GitHub-recognized auto-close keywords (case insensitive):
+          #   close, closes, closed, fix, fixes, fixed, resolve, resolves, resolved
+          # Followed by space(s) and #N. Same regex as the canonical pre-push hook.
+          # `|| true`: GitHub's default run-shell is `bash --noprofile --norc -eo
+          # pipefail`, so `-e` is active even though we only `set -uo pipefail`.
+          # A body with no auto-close keyword (the common, valid case) makes the
+          # first grep exit 1 → pipefail → the substitution exits 1 → `-e` aborts
+          # the script with NO output before the `[ -z ... ]` OK-branch. `|| true`
+          # neutralizes that; emptiness is handled explicitly just below. (#184)
+          AUTOCLOSE_NUMS=$(printf '%s' "$PR_BODY" \
+            | grep -ohiE '\b(close[sd]?|fix(e[sd])?|resolve[sd]?) +#[0-9]+' \
+            | grep -oE '#[0-9]+' \
+            | tr -d '#' \
+            | sort -u || true)
+
+          if [ -z "$AUTOCLOSE_NUMS" ]; then
+            echo "No auto-close keywords in PR body. OK."
+            exit 0
+          fi
+
+          echo "Found auto-close keywords for issues: $AUTOCLOSE_NUMS"
+
+          BLOCKED=""
+          for ISSUE in $AUTOCLOSE_NUMS; do
+            # Query labels on the referenced issue (same-repo)
+            LABELS=$(gh issue view "$ISSUE" --repo "$REPO" --json labels --jq '.labels[].name' 2>/dev/null || echo "")
+            if [ -z "$LABELS" ]; then
+              echo "::warning::Could not query labels for #$ISSUE (deleted? cross-repo?) — skipping."
+              continue
+            fi
+            if echo "$LABELS" | grep -qFx 'type:incident'; then
+              BLOCKED="${BLOCKED} #${ISSUE}"
+            fi
+          done
+
+          if [ -z "$BLOCKED" ]; then
+            echo "All referenced issues are non-incident. OK."
+            exit 0
+          fi
+
+          # Post explanation comment on the PR. Idempotent-ish: check if we
+          # already posted this message recently to avoid spamming on every
+          # edit/synchronize event.
+          MARKER='<!-- block-incident-autoclose:standards#106 -->'
+          EXISTING=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json comments \
+                       --jq ".comments[] | select(.body | contains(\"$MARKER\")) | .id" \
+                       2>/dev/null | head -1)
+
+          if [ -z "$EXISTING" ]; then
+            BODY=$(cat <<EOF
+          $MARKER
+
+          ## Blocked: \`Closes/Fixes/Resolves #N\` for type:incident issue(s) in PR body
+
+          The PR body contains an auto-close keyword targeting:$BLOCKED
+
+          Incident closure is a human-judgment gate (root cause + immediate fix + defense in depth + follow-ups tracked + post-incident write-up), not a side effect of one PR merging.
+
+          **Use \`Refs #N\` or \`Part of #N\` instead** in the PR body. The issue stays open until a human explicitly closes it after verifying full resolution.
+
+          To clear this block:
+          - Edit the PR body to replace the auto-close keyword with \`Refs\` or \`Part of\`
+          - OR remove the \`type:incident\` label from the referenced issue (if it's not actually an incident)
+
+          ---
+          See [DifferentWire/standards#100](https://github.com/DifferentWire/standards/issues/100) for the rationale and [standards#106](https://github.com/DifferentWire/standards/issues/106) for this workflow.
+          EOF
+          )
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$BODY" 2>/dev/null || true
+          fi
+
+          echo "::error::PR body auto-closes type:incident issue(s):$BLOCKED — use Refs/Part-of instead, or remove the type:incident label if not actually an incident."
+          exit 1
