@@ -68,14 +68,20 @@
   #define CAP_ROTATABLE    0   // fixed-landscape 1024x600 MIPI-DSI: no MADCTL rotate, and
                                // software-rotating every flush at this size is not worth it.
                                // Setting is hidden rather than offered-but-ignored.
-  #define CAP_LARGE_SCREEN 0   // TODO(#16): should be 1 (1024x600 is the largest panel in the
-                               // fleet — bigger than Tanmatsu's 800x480, which sets 1). Held at
-                               // 0 ONLY because CAP_LARGE_SCREEN is currently coupled to
-                               // Tanmatsu's render-small-and-upscale path (TAN_PANEL_PW/PH =
-                               // 480x800 hardcoded inside its own #if block, UITask.cpp:1424).
-                               // We render native, so those constants must be decoupled per-board
-                               // before flipping this. Flipping it is what buys the bigger fonts
-                               // (initTouchFontFallbacks) + 1.7x popup cards (PSC) + "UI size".
+  #define CAP_LARGE_SCREEN 1   // 1024x600 — the largest panel in the fleet (Tanmatsu sets 1 at
+                               // merely 800x480). Buys the "UI size" font swap
+                               // (initTouchFontFallbacks: montserrat 12/14/16 -> 16/20/24 ->
+                               // 20/24/28, all compiled in per lv_conf.h) + 1.7x popup cards
+                               // (PSC) + the pinned 16 px tab font.
+                               // Safe despite the Tanmatsu-looking TAN_PANEL_* constants living
+                               // in the same #if block: disp_drv resolution is BOARD-gated
+                               // (HAS_TANMATSU / HAS_CROWPANEL7 / #else), not gated on this flag,
+                               // and the flush upscaler is dead code — s_lv_pw is only ever
+                               // initialised to TAN_PANEL_PW and never reassigned, s_scale_buf is
+                               // never allocated, so `s_lv_pw != TAN_PANEL_PW && s_scale_buf` can
+                               // never be true. UITask.cpp:35963 says so outright: "UI scaling is
+                               // FONT-based at NATIVE resolution now (crisp) ... the flush
+                               // upscaler is left dead".
   #define CAP_SD           0   // microSD present on the board (SDMMC) but not ported yet — Epic E (#10)
   #define CAP_FILESYSTEM   0   // SPIFFS only for now (matches boot: "[BOOT] storage: SPIFFS")
   #define CAP_GPS          0   // no GPS on this HMI (env: "no GPS / env sensors"). Inheriting

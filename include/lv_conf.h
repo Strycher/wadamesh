@@ -48,10 +48,13 @@
 #define LV_FONT_MONTSERRAT_12 1
 #define LV_FONT_MONTSERRAT_14 1
 #define LV_FONT_MONTSERRAT_16 1
-/* Larger Montserrat sizes for the Tanmatsu's crisp "UI size" (Large/Huge) — render the UI bigger
- * at native resolution instead of upscaling a low-res frame. Gated to the Tanmatsu so the
- * flash-tighter S3 touch builds don't pay for fonts they never use. */
-#if defined(HAS_TANMATSU)
+/* Larger Montserrat sizes for the crisp "UI size" (Large/Huge) — render the UI bigger
+ * at native resolution instead of upscaling a low-res frame. Gated to the big-panel boards so the
+ * flash-tighter S3 touch builds don't pay for fonts they never use.
+ * CrowPanel7 (1024x600) added: it's the largest panel in the fleet and initTouchFontFallbacks()
+ * swaps to 16/20/24 (Large) and 20/24/28 (Huge) — without these it fails to compile under
+ * CAP_LARGE_SCREEN. Flash cost is a non-issue here: 16 MB flash, app ~65% of a 3.875 MB slot. */
+#if defined(HAS_TANMATSU) || defined(HAS_CROWPANEL7)
 #define LV_FONT_MONTSERRAT_18 1
 #define LV_FONT_MONTSERRAT_20 1
 #define LV_FONT_MONTSERRAT_24 1

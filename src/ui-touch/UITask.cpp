@@ -7207,10 +7207,23 @@ static void openAdvertModalCb(lv_event_t* e) {
 
   // Full-screen app page using the GLOBAL tall status bar ("‹ Send advert", tap = Back) — same
   // chrome as RF Monitor / Spectrum, instead of a modal with its own header.
+  //
+  // Go tall BEFORE laying out, and lay out against statusBarCurH() (the ACTUAL bar
+  // height = STATUSBAR_H*2 when tall), not STATUSBAR_H.
+  // Bug this fixes (#16, owner: "the only way out of the Advert screen is to send an
+  // advert; Back doesn't work"): the page pinned itself at y=STATUSBAR_H (22) while the
+  // bar was tall (44) and — being created later on the same lv_layer_top() — sat ON TOP
+  // of bar rows 22..44. That band is exactly where the centred "‹ Send advert" back
+  // affordance lives, so the page swallowed every tap on it and the page could not be
+  // dismissed. Same latent pattern exists in the Spectrum / RF Monitor pages (they set
+  // tall AFTER positioning at STATUSBAR_H too) — left alone here deliberately; they're
+  // shared with the S3 boards and unreported. Tracked in #16.
+  statusBarSetTall(true);
+  const lv_coord_t bar_h = statusBarCurH();
   s_advert_root = lv_obj_create(lv_layer_top());
   lv_obj_remove_style_all(s_advert_root);
-  lv_obj_set_size(s_advert_root, sw, sh - STATUSBAR_H);
-  lv_obj_set_pos(s_advert_root, 0, STATUSBAR_H);
+  lv_obj_set_size(s_advert_root, sw, sh - bar_h);
+  lv_obj_set_pos(s_advert_root, 0, bar_h);
   lv_obj_set_style_bg_color(s_advert_root, lv_color_hex(COLOR_BG), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_advert_root, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_clear_flag(s_advert_root, LV_OBJ_FLAG_SCROLLABLE);
@@ -7218,16 +7231,17 @@ static void openAdvertModalCb(lv_event_t* e) {
 
   s_apppage_title = "Send advert";
   s_apppage_close = closeAdvertPage;
-  statusBarSetTall(true);
-  updateGlobalStatusBar();
-  const int top = STATUSBAR_H + 8;
+  updateGlobalStatusBar();   // (tall already set above, before layout)
+  // Content offsets are relative to s_advert_root, which now starts BELOW the tall
+  // bar — so the old "STATUSBAR_H + 8" (absolute-ish) becomes a plain top padding.
+  const int top = 8;
 
   // Scroll viewport below the tall bar + a single content child that grows to its contents
   // (the modal used the same pattern to keep LVGL's scroll-bounds machinery happy).
   lv_obj_t* scroll = lv_obj_create(s_advert_root);
   lv_obj_remove_style_all(scroll);
   lv_obj_set_pos(scroll, 4, top);
-  lv_obj_set_size(scroll, sw - 8, (sh - STATUSBAR_H) - top - 4);
+  lv_obj_set_size(scroll, sw - 8, (sh - bar_h) - top - 4);
   lv_obj_set_style_pad_all(scroll, 0, LV_PART_MAIN);
   lv_obj_set_scroll_dir(scroll, LV_DIR_VER);
   lv_obj_set_scrollbar_mode(scroll, LV_SCROLLBAR_MODE_ON);   // always show — remove_style_all stripped the default bar
@@ -9929,7 +9943,11 @@ static void buildDeviceSettings(int sec) {
     y += SC(44);
   }
   /* Message LED: flash the envelope-icon LED on a new message and softly breathe it while there
-     are unread messages. Turn off to keep that LED dark. (Tanmatsu only — the others have no such LED.) */
+     are unread messages. Turn off to keep that LED dark. (Tanmatsu only — the others have no such LED.)
+     Gated on HAS_TANMATSU, NOT CAP_LARGE_SCREEN: this is a Tanmatsu HARDWARE feature that was
+     riding the large-screen flag only because Tanmatsu was the sole large-screen board. CrowPanel7
+     (1024x600, no such LED) is the second one and doesn't define touchPrefsGetMsgLed/msgLedToggleCb. */
+#if defined(HAS_TANMATSU)
   {
     int h = settingsRowLabel(body, y, 6, "Message LED", COLOR_SUB, nullptr, 56);
     lv_obj_t* sw = lv_switch_create(body);
@@ -9938,6 +9956,7 @@ static void buildDeviceSettings(int sec) {
     lv_obj_add_event_cb(sw, msgLedToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
     y += LV_MAX(40, h + 12);
   }
+#endif
 #endif
 
   /* Distance units: OFF = km (default), ON = miles. Applies immediately. */
@@ -17768,23 +17787,28 @@ static void openSignalInfoPopup() {
   lv_label_set_text(dlbl, TR("Auto-discover"));
   lv_obj_set_style_text_color(dlbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
   lv_obj_set_style_text_font(dlbl, &g_font_12, LV_PART_MAIN);
-  lv_obj_set_pos(dlbl, 0, cy + 4);
+  lv_obj_set_pos(dlbl, 0, cy + SC(4));
   lv_obj_t* dsw = lv_switch_create(card);            // theme recolours the "on" track to the accent
-  lv_obj_set_size(dsw, 44, 24);
-  lv_obj_set_pos(dsw, card_w - 20 - 44, cy);
+  lv_obj_set_size(dsw, SC(44), SC(24));
+  lv_obj_set_pos(dsw, card_w - 20 - SC(44), cy);
   if (touchPrefsGetSigProbeEnabled()) lv_obj_add_state(dsw, LV_STATE_CHECKED);
   lv_obj_add_event_cb(dsw, sigProbeToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
-  cy += 32;
+  cy += SC(32);   // scale with the row (see the SC() note on the poll row below)
 
   // ---- Poll interval (minutes; clamped 1..1440 on Set) ----
+  // Positions/sizes go through SC() so the row tracks the UI-size font swap. With raw
+  // pixels (x=70/122/168, tuned for a 12 px font) the wider Large/Huge fonts overran
+  // their slots: "Poll every" was clipped mid-word by the textarea and the taller row
+  // spilled into "Probe now" (#16, owner-reported). SC() is identity on the S3 boards
+  // (s_ui_fscale only moves under CAP_LARGE_SCREEN), so they are unchanged.
   lv_obj_t* plbl = lv_label_create(card);
   lv_label_set_text(plbl, TR("Poll every"));
   lv_obj_set_style_text_color(plbl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_font(plbl, &g_font_12, LV_PART_MAIN);
-  lv_obj_set_pos(plbl, 0, cy + 7);
+  lv_obj_set_pos(plbl, 0, cy + SC(7));
   s_sig_poll_ta = lv_textarea_create(card);
-  lv_obj_set_size(s_sig_poll_ta, 46, 30);
-  lv_obj_set_pos(s_sig_poll_ta, 70, cy);
+  lv_obj_set_size(s_sig_poll_ta, SC(46), SC(30));
+  lv_obj_set_pos(s_sig_poll_ta, SC(70), cy);
   lv_textarea_set_one_line(s_sig_poll_ta, true);
   lv_textarea_set_max_length(s_sig_poll_ta, 4);
   attachSettingsTaEvents(s_sig_poll_ta);
@@ -17794,20 +17818,20 @@ static void openSignalInfoPopup() {
   lv_label_set_text(ulbl, TR("min"));
   lv_obj_set_style_text_color(ulbl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_font(ulbl, &g_font_12, LV_PART_MAIN);
-  lv_obj_set_pos(ulbl, 122, cy + 7);
+  lv_obj_set_pos(ulbl, SC(122), cy + SC(7));
   lv_obj_t* setb = lv_btn_create(card);
-  lv_obj_set_size(setb, 50, 30);
-  lv_obj_set_pos(setb, 168, cy);
+  lv_obj_set_size(setb, SC(50), SC(30));
+  lv_obj_set_pos(setb, SC(168), cy);
   styleButton(setb);
   lv_obj_add_event_cb(setb, sigPollSaveCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* setl = lv_label_create(setb);
   lv_label_set_text(setl, TR("Set"));
   lv_obj_center(setl);
-  cy += 40;
+  cy += SC(40);   // was 40: too short once the row grew -> overlapped "Probe now"
 
   // ---- Manual probe button ----
   lv_obj_t* rfb = lv_btn_create(card);
-  lv_obj_set_size(rfb, card_w - 20, 32);
+  lv_obj_set_size(rfb, card_w - 20, SC(32));
   lv_obj_set_pos(rfb, 0, cy);
   styleButton(rfb);
   lv_obj_add_event_cb(rfb, sigProbeNowCb, LV_EVENT_CLICKED, nullptr);

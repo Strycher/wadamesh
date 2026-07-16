@@ -29,6 +29,7 @@
 #include <driver/ledc.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
 #include "esp_lcd_ek79007.h"
 
 #define CP7_LDO_MIPI_PHY_CHAN   3     // DPHY power, 2.5 V
@@ -51,6 +52,25 @@ static esp_lcd_dsi_bus_handle_t  s_dsi_bus = nullptr;
 static esp_lcd_panel_io_handle_t s_io      = nullptr;
 static esp_ldo_channel_handle_t  s_ldo3    = nullptr;
 static esp_ldo_channel_handle_t  s_ldo4    = nullptr;
+
+// DMA2D copy-complete signal. esp_lcd_panel_draw_bitmap() on a DPI panel with
+// use_dma2d=true is ASYNCHRONOUS: it starts a DMA2D blit from the caller's buffer
+// into the panel framebuffer and returns immediately. Without waiting, UITask's
+// lvglFlush calls lv_disp_flush_ready() right after, LVGL reuses the draw buffer
+// for the next band WHILE DMA2D is still reading the previous one, and the panel
+// shows torn/stale content — the "every popup/modal leaves artifacts behind"
+// class of bug (#16). DCC never hit this because esp_lvgl_port registers this
+// callback for you; this driver is hand-rolled, so it must do it itself.
+static SemaphoreHandle_t s_trans_done = nullptr;
+
+static bool IRAM_ATTR cp7ColorTransDone(esp_lcd_panel_handle_t panel,
+                                        esp_lcd_dpi_panel_event_data_t* edata,
+                                        void* user_ctx) {
+  (void)panel; (void)edata; (void)user_ctx;
+  BaseType_t hp = pdFALSE;
+  if (s_trans_done) xSemaphoreGiveFromISR(s_trans_done, &hp);
+  return hp == pdTRUE;   // true -> request a context switch on ISR exit
+}
 
 #define DSP_STEP(tag, call)                                    \
   do {                                                         \
@@ -151,6 +171,18 @@ bool CrowPanel7Display::begin() {
   DSP_STEP("panel reset", esp_lcd_panel_reset(s_panel));
   DSP_STEP("panel init", esp_lcd_panel_init(s_panel));
 
+  // 5b. DMA2D copy-complete callback — MUST exist before any draw_bitmap, see
+  // the s_trans_done note above. Without it every partial redraw can tear.
+  s_trans_done = xSemaphoreCreateBinary();
+  if (!s_trans_done) {
+    Serial.println("[DSP] trans-done semaphore alloc FAILED");
+    return false;
+  }
+  esp_lcd_dpi_panel_event_callbacks_t dpi_cbs = {};
+  dpi_cbs.on_color_trans_done = cp7ColorTransDone;
+  DSP_STEP("dpi trans-done cb",
+           esp_lcd_dpi_panel_register_event_callbacks(s_panel, &dpi_cbs, nullptr));
+
   // 6. Panel streaming — light it up.
   setBrightness(100);
   Serial.printf("[DSP] EK79007 up (%dx%d, %d lanes @ %d Mbps, DPI %d MHz, vendor-init)\n",
@@ -165,6 +197,19 @@ void CrowPanel7Display::writePixelsRGB565(int x, int y, int w, int h, const uint
   if (!s_panel) return;
   // draw_bitmap takes END-EXCLUSIVE coords (same convention DCC's flush used).
   esp_lcd_panel_draw_bitmap(s_panel, x, y, x + w, y + h, pixels);
+  // BLOCK until DMA2D has finished reading `pixels`. draw_bitmap is async with
+  // use_dma2d=true, and UITask's lvglFlush calls lv_disp_flush_ready() the moment
+  // this returns — releasing the draw buffer for LVGL to overwrite. Returning
+  // early = LVGL scribbles on the buffer mid-copy = torn/stale bands (#16).
+  // Bounded wait, and loud on timeout: a missed callback must degrade to a slow
+  // UI with a visible reason, never a silent hang (SAFELANE §6).
+  if (s_trans_done && xSemaphoreTake(s_trans_done, pdMS_TO_TICKS(100)) != pdTRUE) {
+    static uint32_t s_timeouts = 0;
+    if ((s_timeouts++ % 64) == 0) {   // rate-limited: never flood the pipe
+      Serial.printf("[DSP] WARN: DMA2D color-trans-done timeout (100ms) x%lu\n",
+                    (unsigned long)s_timeouts);
+    }
+  }
 }
 
 void CrowPanel7Display::setBrightness(uint8_t percent) {
