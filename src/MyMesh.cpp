@@ -1,4 +1,7 @@
 #include "MyMesh.h"
+#if defined(HAS_CROWPANEL7)
+#include "helpers/offband/SdLog.h"   // `log` CLI command (#19)
+#endif
 
 #include <Arduino.h> // needed for PlatformIO
 #include <Mesh.h>
@@ -535,6 +538,21 @@ bool MyMesh::handleMeshcomodCommand(const char* text, int text_len) {
     return strncasecmp(s, name, n) == 0 && (s[n] == '\0' || s[n] == ' ' || s[n] == '\t');
   };
 
+#if defined(HAS_CROWPANEL7)
+  // `log` / `log all` — stream the TF-card log over serial so it can be pulled
+  // WITHOUT removing the card: `scripts/pio-flash send crowpanel7-dev log --read-time 20`.
+  // A log you can only read by pulling the card isn't observability (#19).
+  // Default dumps the last 16 KB (post-mortems are at the tail; a full dump at
+  // 115200 is ~11.5 KB/s). `log all` dumps everything.
+  if (isCmd(p, "log")) {
+    const char* arg = p + 3;
+    while (*arg == ' ') arg++;
+    const bool all = (strncmp(arg, "all", 3) == 0);
+    offband::sdLogDumpSerial(all ? 0 : 16384);
+    pushMeshcomodReply(offband::sdLogAvailable() ? "log dumped to serial" : "no TF log (card not mounted)");
+    return true;
+  }
+#endif
   if (isCmd(p, "ver") || isCmd(p, "version")) {
     char r[96];
     snprintf(r, sizeof r, "Meshcomod %s\nbuild %s  (code %d)",

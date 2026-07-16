@@ -52,4 +52,13 @@ void sdLogf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 // Human-readable mount status for the UI/CLI ("no card", "mounted 29.7 GB", …).
 const char* sdLogStatus();
 
+// Stream the log file to Serial for EXTRACTION WITHOUT PULLING THE CARD.
+// tail_bytes = 0 dumps the whole file; otherwise only the last tail_bytes
+// (post-mortems live at the end, and 115200 baud makes a full dump slow).
+// Framed with BEGIN/END markers so a host-side capture can find the payload.
+// Driven from the serial CLI: `scripts/pio-flash send crowpanel7-dev log`
+// (see MyMesh.cpp). Writing a log nobody can read off the device is not
+// observability — #19.
+void sdLogDumpSerial(size_t tail_bytes);
+
 }  // namespace offband

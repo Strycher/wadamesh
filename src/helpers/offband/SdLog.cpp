@@ -143,4 +143,40 @@ const char* sdLogStatus()  { return "n/a"; }
 
 #endif
 
+
+void sdLogDumpSerial(size_t tail_bytes) {
+#ifdef ARDUINO
+    if (!s_mounted) {
+        Serial.printf("[SD] no log to dump (%s)\n", s_status);
+        return;
+    }
+    FILE* f = fopen(kLogPath, "r");
+    if (!f) {
+        Serial.printf("[SD] fopen(%s) for read FAILED\n", kLogPath);
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    long from = 0;
+    if (tail_bytes > 0 && size > (long)tail_bytes) from = size - (long)tail_bytes;
+    fseek(f, from, SEEK_SET);
+
+    Serial.printf("\n===== SDLOG BEGIN %s (%ld bytes, from %ld) =====\n",
+                  kLogPath, size, from);
+    // Chunked so we never sit on a big stack buffer, and so a huge file can't
+    // monopolise the loop in one go.
+    char buf[256];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        Serial.write((const uint8_t*)buf, n);
+        // 115200 baud (~11.5 KB/s): let the UART drain rather than overrun it.
+        if ((n == sizeof(buf))) delay(1);
+    }
+    fclose(f);
+    Serial.println("\n===== SDLOG END =====");
+#else
+    (void)tail_bytes;
+#endif
+}
+
 }  // namespace offband
