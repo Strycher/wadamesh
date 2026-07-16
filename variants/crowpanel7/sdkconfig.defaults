@@ -59,9 +59,21 @@ CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CLK_SLOT_1=18
 CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D0_SLOT_1=14
 CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D1_1BIT_BUS_SLOT_1=15
 CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=32
-CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=40000
+# 10 MHz, NOT 40: Elecrow's own C6-upgrade tool uses 10000 for the 7" board
+# (crowpanel-advanced-p4-c6-upgrade platformio.ini). DCC's unit tolerates
+# 40 MHz; this unit's handshake dies at 40 with card-init still passing —
+# classic marginal-signal-integrity signature (#12). Revisit upward only with
+# on-device evidence at each step.
+CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=10000
 CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH=y
 CONFIG_ESP_HOSTED_SDIO_RESET_DELAY_MS=1500
+
+# A hosted-transport failure must NOT reboot the node (first-flash lesson:
+# handshake timeout -> esp_hosted host self-reset -> infinite ~16 s boot loop,
+# black screen, boot counter 328). With =n the failure surfaces as
+# ESP_HOSTED_EVENT_TRANSPORT_FAILURE and the mesh/display keep running.
+CONFIG_ESP_HOSTED_TRANSPORT_RESTART_ON_FAILURE=n
+CONFIG_ESP_HOSTED_HOST_RESTART_NO_COMMUNICATION_WITH_SLAVE=n
 
 # TLS buffer sizing (matches the S3 envs' MBEDTLS flags)
 CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y

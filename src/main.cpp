@@ -248,14 +248,14 @@ void setup() {
 #if ESP_IDF_VERSION_MAJOR >= 5
   // IDF 5 (P4 hybrid build): the int/bool init() is gone and the TWDT is already
   // running (started by arduino), so reconfigure it in place — same 20 s + panic.
+  // idle_core_mask MUST be 0x1 (IDLE0 only), matching arduino's S3 default:
+  // wadamesh's loopTask spins CPU1 without yielding BY DESIGN, so IDLE1 never
+  // runs. Watching IDLE1 (first P4 bring-up did, mask 0x3) reboots the node
+  // 20-45 s into any session — the "random" config-flow crashes in #12.
   {
     esp_task_wdt_config_t twdt_cfg = {};
     twdt_cfg.timeout_ms = 20000;
-#if CONFIG_FREERTOS_UNICORE
-    twdt_cfg.idle_core_mask = 0x1;
-#else
-    twdt_cfg.idle_core_mask = 0x3;
-#endif
+    twdt_cfg.idle_core_mask = 0x1;   // IDLE0 only — never IDLE1 (see above)
     twdt_cfg.trigger_panic = true;
     esp_task_wdt_reconfigure(&twdt_cfg);
   }
