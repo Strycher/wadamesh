@@ -56,8 +56,11 @@ CONFIG_ESP_HOSTED_SDIO_1_BIT_BUS=y
 CONFIG_ESP_HOSTED_SDIO_BUS_WIDTH=1
 CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CMD_SLOT_1=19
 CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CLK_SLOT_1=18
-CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D0_SLOT_1=14
-CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D1_1BIT_BUS_SLOT_1=15
+# Data lines: V1.1/V1.2 rev wiring (D0=17 D1=16). V1.0=DCC used 14/15.
+# hostedSetPins() in target.cpp is what actually takes effect (prebuilt arduino
+# lib), but keep these consistent. See target.cpp note (#12).
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D0_SLOT_1=17
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D1_1BIT_BUS_SLOT_1=16
 CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=32
 # 10 MHz, NOT 40: Elecrow's own C6-upgrade tool uses 10000 for the 7" board
 # (crowpanel-advanced-p4-c6-upgrade platformio.ini). DCC's unit tolerates

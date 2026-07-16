@@ -42,13 +42,24 @@ EnvironmentSensorManager sensors;
 // Correct reset = GPIO32 (C6 EN, DCC-verified). variants/crowpanel7/
 // pins_arduino.h documents the full intended variant for a future
 // non-hybrid build.
+//
+// SDIO DATA LINES ARE BOARD-REV-SPECIFIC (#12 real root cause). Elecrow
+// REVERSED the P4<->C6 data routing between V1.0 and V1.1/V1.2 (verified in
+// Eagle_SCH&PCB/{1.0,1.1,1.2}.sch):
+//   V1.0        : D0=14 D1=15 D2=16 D3=17   (DCC's unit — why 14/15 works there)
+//   V1.1 / V1.2 : D0=17 D1=16 D2=15 D3=14   (reversed — THIS unit)
+// CLK=18/CMD=19 unchanged across revs, so a wrong data map still passes SDIO
+// card-init (CMD+CLK only) but the DAT1 slave-ready interrupt lands on a dead
+// pin -> "Card init success" then "Waiting for slave to be ready" forever.
+// That symptom cost most of this session; it was a copied-from-DCC config, not
+// a bad C6. If a future unit is V1.0, swap back to 14/15/16/17.
 #include "esp32-hal-hosted.h"
 static void setHostedPinsForCrowPanel() {
-  if (!hostedSetPins(/*clk*/18, /*cmd*/19, /*d0*/14, /*d1*/15,
-                     /*d2*/16, /*d3*/17, /*rst*/32)) {
-    Serial.println("[BOOT] hostedSetPins REFUSED (hosted already up?) - C6 reset pin may be wrong");
+  if (!hostedSetPins(/*clk*/18, /*cmd*/19, /*d0*/17, /*d1*/16,
+                     /*d2*/15, /*d3*/14, /*rst*/32)) {
+    Serial.println("[BOOT] hostedSetPins REFUSED (hosted already up?) - pins may be wrong");
   } else {
-    Serial.println("[BOOT] hosted sdio pins set (rst=32)");
+    Serial.println("[BOOT] hosted sdio pins set (V1.1/V1.2: d0=17 d1=16, rst=32)");
   }
 }
 

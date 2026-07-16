@@ -47,13 +47,15 @@ static const uint8_t SCK = 8;
 // board's real SDMMC slot wiring, not the EV board's.
 
 // WIFI/BLE co-processor - ESP32-C6 over 1-bit SDIO (slot 1)
+// SDIO data lines: V1.1/V1.2 wiring (Elecrow reversed them vs V1.0 = DCC).
+// V1.0: D0=14 D1=15 D2=16 D3=17. See target.cpp for the full note (#12).
 #define BOARD_HAS_SDIO_ESP_HOSTED
 #define BOARD_SDIO_ESP_HOSTED_CLK   18
 #define BOARD_SDIO_ESP_HOSTED_CMD   19
-#define BOARD_SDIO_ESP_HOSTED_D0    14
-#define BOARD_SDIO_ESP_HOSTED_D1    15
-#define BOARD_SDIO_ESP_HOSTED_D2    16
-#define BOARD_SDIO_ESP_HOSTED_D3    17
+#define BOARD_SDIO_ESP_HOSTED_D0    17
+#define BOARD_SDIO_ESP_HOSTED_D1    16
+#define BOARD_SDIO_ESP_HOSTED_D2    15
+#define BOARD_SDIO_ESP_HOSTED_D3    14
 #define BOARD_SDIO_ESP_HOSTED_RESET 32   // C6 EN - DCC-verified. NOT 54 (LoRa reset).
 
 #endif /* Pins_Arduino_h */

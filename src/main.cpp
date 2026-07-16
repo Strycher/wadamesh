@@ -1,6 +1,7 @@
 #include <Arduino.h>   // needed for PlatformIO
 #include <Mesh.h>
 #include "MyMesh.h"
+#include "helpers/offband/CrashLog.h"   // RTC_NOINIT boot-log ring buffer (#13)
 #if defined(ESP32_PLATFORM)
   #include <new>               // placement-new for the PSRAM-resident the_mesh
   #include "esp_heap_caps.h"   // heap_caps_malloc(MALLOC_CAP_SPIRAM)
@@ -181,7 +182,19 @@ extern "C" void set_boot_phase(int phase) { g_boot_phase = phase; }
 
 
 void halt() {
-  while (1) ;
+  // Was a bare silent while(1) — a SAFELANE §6 violation: a halt with no
+  // reason erases the very evidence needed to diagnose it. Surface it loudly
+  // and keep re-emitting so a monitor attached late still catches it (#13).
+  offband::crashLogf("[HALT] setup aborted — spinning. See boot log above for cause.");
+  Serial.flush();
+  uint32_t last = 0;
+  while (1) {
+    if (millis() - last >= 3000) {   // heartbeat so late-attached monitors see it
+      last = millis();
+      Serial.println("[HALT] node halted in setup() (radio/init failure). Power-cycle after fixing.");
+    }
+    delay(50);
+  }
 }
 
 /* WIFI RECONNECT TRACKERS */
@@ -236,7 +249,12 @@ static void bleStartIfPending(const char* why) {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("[BOOT] setup start");
+  // FIRST: recover the previous boot's log (survives WDT/panic/brownout in
+  // RTC_NOINIT) and install the esp_log capture hook, so nothing boot-time is
+  // lost to monitor-attach latency. SAFELANE §6 no-silent-failures (#13).
+  offband::crashLogBegin();
+  offband::crashLogf("[BOOT] setup start (reset=%s)",
+                     offband::resetReasonString(esp_reset_reason()));
 
   // Widen the task-watchdog grace period. The ~5 s default trips during a legitimate-but-slow flash
   // burst — a SPIFFS garbage-collect, or a bulk save (DataStore issues ~12 flash ops per contact,
