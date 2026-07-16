@@ -35864,6 +35864,15 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
       const size_t buf_bytes = sizeof(lv_color_t) * g_draw_buf_px;
       g_draw_buffer = (lv_color_t*)heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
       if (!g_draw_buffer) g_draw_buffer = (lv_color_t*)malloc(buf_bytes);
+#elif defined(HAS_CROWPANEL7)
+      // P4 + native 1024x600, no rotation. Full-WIDTH band (1024 px) so each
+      // flushed area is a complete row-run. 32MB PSRAM is abundant and the
+      // MIPI-DSI DMA2D flush reads PSRAM fine (same rationale as Tanmatsu);
+      // internal DRAM stays free for WiFi/hosted DMA.
+      g_draw_buf_px = 1024 * LV_DRAW_BUF_LINES;
+      const size_t buf_bytes = sizeof(lv_color_t) * g_draw_buf_px;
+      g_draw_buffer = (lv_color_t*)heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (!g_draw_buffer) g_draw_buffer = (lv_color_t*)malloc(buf_bytes);
 #else
       const size_t buf_bytes = sizeof(lv_color_t) * 240 * LV_DRAW_BUF_LINES;
       // Internal DMA-capable DRAM — this is the hot loop's read source
@@ -35957,6 +35966,15 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
     // stays == the panel width, so it's never entered).
     g_lv.disp_drv.hor_res  = TAN_PANEL_PW;   // 480
     g_lv.disp_drv.ver_res  = TAN_PANEL_PH;   // 800
+#elif defined(HAS_CROWPANEL7)
+    // EK79007 MIPI-DSI is NATIVE landscape 1024x600 — no rotation of any kind
+    // (hardware MADCTL or LVGL software). Register the panel's real size so
+    // every lv_disp_get_hor/ver_res() layout query in this file sees the whole
+    // surface. Without this branch the #else fallback below hardcodes the S3
+    // TFT's 320x240 and the entire UI renders into 76,800 of the panel's
+    // 614,400 px — exactly 1/8 of the screen (owner-observed, #7).
+    g_lv.disp_drv.hor_res  = 1024;
+    g_lv.disp_drv.ver_res  = 600;
 #else
     // Landscape rotates the panel in HARDWARE (smooth — no per-pixel software
     // rotation each flush), so tell LVGL the already-rotated resolution and let
