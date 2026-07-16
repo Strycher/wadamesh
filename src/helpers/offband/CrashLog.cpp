@@ -13,6 +13,7 @@
 #ifdef ARDUINO
   #include <Arduino.h>
   #include <esp_attr.h>      // RTC_NOINIT_ATTR
+  #include <esp_heap_caps.h> // heap_caps_malloc(MALLOC_CAP_SPIRAM) for the prev-boot copy
   #include <esp_system.h>    // esp_reset_reason(), esp_register_shutdown_handler()
   #include <esp_log.h>       // esp_log_set_vprintf()
   #include <freertos/FreeRTOS.h>
@@ -73,6 +74,13 @@ static char           s_data[kCrashLogDataSize];
 
 static bool s_begin_called = false;
 
+// Copy of the PREVIOUS boot's recovered log, taken before the ring is reset for
+// this boot. Consumed by SdLog (#19) to persist post-mortems to the TF card.
+// PSRAM-first: 4 KB of scarce internal DRAM for a diagnostic copy isn't worth it.
+static char* s_prev_copy = nullptr;
+
+const char* crashLogPrevBootText() { return s_prev_copy ? s_prev_copy : ""; }
+
 // Caller MUST hold the critical section.
 static void writeToRing(const char* src, size_t n) {
     if (n == 0) return;
@@ -126,6 +134,24 @@ void crashLogBegin() {
                       (unsigned)s_header.wrapped);
         Serial.println("=========================================================");
         dumpRing();
+        // Stash a copy BEFORE the header is reset below — SdLog (#19) persists it
+        // to the TF card so a post-mortem survives a power cycle too.
+        {
+          size_t start = s_header.wrapped ? s_header.write_index : 0;
+          size_t count = s_header.wrapped ? kCrashLogDataSize : s_header.write_index;
+          s_prev_copy = (char*)heap_caps_malloc(count + 1, MALLOC_CAP_SPIRAM);
+          if (!s_prev_copy) s_prev_copy = (char*)malloc(count + 1);
+          if (s_prev_copy) {
+            size_t n = 0;
+            for (size_t i = 0; i < count; ++i) {
+              char c = s_data[(start + i) % kCrashLogDataSize];
+              if (c != '\0') s_prev_copy[n++] = c;
+            }
+            s_prev_copy[n] = '\0';
+          } else {
+            Serial.println("[CrashLog] WARN: could not allocate previous-boot copy (SD persist will be empty)");
+          }
+        }
         Serial.println();
         Serial.println("=========================================================");
         Serial.println("=== END PREVIOUS BOOT (this boot's writes start here) ===");

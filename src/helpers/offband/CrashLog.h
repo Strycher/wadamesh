@@ -53,6 +53,12 @@ void crashLogf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 // Dump the current buffer to serial without clearing (on-demand inspection).
 void crashLogDump();
 
+// The PREVIOUS boot's recovered log text, stashed by crashLogBegin() before the
+// ring is reset for this boot. Empty string (never nullptr) on a cold power-on
+// or if the copy couldn't be allocated. Lets a later consumer persist the
+// post-mortem — see SdLog (#19), which writes it to the TF card.
+const char* crashLogPrevBootText();
+
 // Mark the buffer empty (rewrite magic, reset index); underlying bytes kept.
 void crashLogClear();
 

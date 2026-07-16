@@ -2,6 +2,7 @@
 #include <Mesh.h>
 #include "MyMesh.h"
 #include "helpers/offband/CrashLog.h"   // RTC_NOINIT boot-log ring buffer (#13)
+#include "helpers/offband/SdLog.h"       // persistent boot log on the TF card (#19)
 #if defined(ESP32_PLATFORM)
   #include <new>               // placement-new for the PSRAM-resident the_mesh
   #include "esp_heap_caps.h"   // heap_caps_malloc(MALLOC_CAP_SPIRAM)
@@ -313,6 +314,14 @@ void setup() {
 
   board.begin();
   Serial.println("[BOOT] board ok");
+
+  // TF/microSD persistent log (#19). AFTER board.begin() so the rails are up and
+  // AFTER crashLogBegin() (which stashed the previous boot's log) — this writes
+  // that post-mortem to the card so it survives a power cycle and can be read by
+  // pulling the card, with no serial monitor ever attached (#18).
+  // No-op on boards without it; never fatal, never hangs boot with no card.
+  offband::sdLogBegin();
+  Serial.printf("[BOOT] sd log: %s\n", offband::sdLogStatus());
 
 #ifdef DISPLAY_CLASS
   DisplayDriver* disp = NULL;
