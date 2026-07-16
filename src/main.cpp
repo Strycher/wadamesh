@@ -1,8 +1,15 @@
 #include <Arduino.h>   // needed for PlatformIO
 #include <Mesh.h>
 #include "MyMesh.h"
-#include "helpers/offband/CrashLog.h"   // RTC_NOINIT boot-log ring buffer (#13)
-#include "helpers/offband/SdLog.h"       // persistent boot log on the TF card (#19)
+// Offband observability (#13 RTC ring, #19 TF-card log). CrowPanel7-only for now:
+// the sources are in this env's build_src_filter only, so the calls MUST be gated
+// or the S3 touch builds fail to link. CrashLog is generic-ESP32 and would benefit
+// the S3 fleet too — enabling it there is a deliberate behaviour change (4KB RTC +
+// esp_log hook + boot dump) and needs the owner's call, so it is NOT done here.
+#if defined(HAS_CROWPANEL7)
+  #include "helpers/offband/CrashLog.h"
+  #include "helpers/offband/SdLog.h"
+#endif
 #if defined(ESP32_PLATFORM)
   #include <new>               // placement-new for the PSRAM-resident the_mesh
   #include "esp_heap_caps.h"   // heap_caps_malloc(MALLOC_CAP_SPIRAM)
@@ -186,7 +193,11 @@ void halt() {
   // Was a bare silent while(1) — a SAFELANE §6 violation: a halt with no
   // reason erases the very evidence needed to diagnose it. Surface it loudly
   // and keep re-emitting so a monitor attached late still catches it (#13).
+#if defined(HAS_CROWPANEL7)
   offband::crashLogf("[HALT] setup aborted — spinning. See boot log above for cause.");
+#else
+  Serial.println("[HALT] setup aborted — spinning. See boot log above for cause.");
+#endif
   Serial.flush();
   uint32_t last = 0;
   while (1) {
@@ -253,9 +264,13 @@ void setup() {
   // FIRST: recover the previous boot's log (survives WDT/panic/brownout in
   // RTC_NOINIT) and install the esp_log capture hook, so nothing boot-time is
   // lost to monitor-attach latency. SAFELANE §6 no-silent-failures (#13).
+#if defined(HAS_CROWPANEL7)
   offband::crashLogBegin();
   offband::crashLogf("[BOOT] setup start (reset=%s)",
                      offband::resetReasonString(esp_reset_reason()));
+#else
+  Serial.println("[BOOT] setup start");
+#endif
 
   // Widen the task-watchdog grace period. The ~5 s default trips during a legitimate-but-slow flash
   // burst — a SPIFFS garbage-collect, or a bulk save (DataStore issues ~12 flash ops per contact,
@@ -320,8 +335,10 @@ void setup() {
   // that post-mortem to the card so it survives a power cycle and can be read by
   // pulling the card, with no serial monitor ever attached (#18).
   // No-op on boards without it; never fatal, never hangs boot with no card.
+#if defined(HAS_CROWPANEL7)
   offband::sdLogBegin();
   Serial.printf("[BOOT] sd log: %s\n", offband::sdLogStatus());
+#endif
 
 #ifdef DISPLAY_CLASS
   DisplayDriver* disp = NULL;
