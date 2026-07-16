@@ -60,6 +60,30 @@
   #define CAP_OTA          1   // 16 MB flash, dual A/B app slots (see partitions_tdeck_touch.csv)
   #define CAP_LOCK_SCREEN  1
 
+#elif defined(HAS_CROWPANEL7)           // ===== Elecrow CrowPanel Advance 7 (ESP32-P4) =====
+  // Was silently falling through to the Heltec V4 defaults below — a 240x320 S3
+  // board — which is why it advertised a rotation setting it cannot honour and
+  // polled a GPS it does not have (#16).
+  #define CAP_TOUCH        1   // GT911 capacitive touch (verified on device)
+  #define CAP_ROTATABLE    0   // fixed-landscape 1024x600 MIPI-DSI: no MADCTL rotate, and
+                               // software-rotating every flush at this size is not worth it.
+                               // Setting is hidden rather than offered-but-ignored.
+  #define CAP_LARGE_SCREEN 0   // TODO(#16): should be 1 (1024x600 is the largest panel in the
+                               // fleet — bigger than Tanmatsu's 800x480, which sets 1). Held at
+                               // 0 ONLY because CAP_LARGE_SCREEN is currently coupled to
+                               // Tanmatsu's render-small-and-upscale path (TAN_PANEL_PW/PH =
+                               // 480x800 hardcoded inside its own #if block, UITask.cpp:1424).
+                               // We render native, so those constants must be decoupled per-board
+                               // before flipping this. Flipping it is what buys the bigger fonts
+                               // (initTouchFontFallbacks) + 1.7x popup cards (PSC) + "UI size".
+  #define CAP_SD           0   // microSD present on the board (SDMMC) but not ported yet — Epic E (#10)
+  #define CAP_FILESYSTEM   0   // SPIFFS only for now (matches boot: "[BOOT] storage: SPIFFS")
+  #define CAP_GPS          0   // no GPS on this HMI (env: "no GPS / env sensors"). Inheriting
+                               // CAP_GPS=1 made the UI poll a nonexistent GPS — the recurring
+                               // "[STALL] ui:gps ~498ms" in every boot capture.
+  #define CAP_OTA          1   // dual app slots (partitions_crowpanel7.csv: app0/app1 0x3e0000 each)
+  #define CAP_LOCK_SCREEN  0   // unchanged from the inherited default (no behaviour change here)
+
 #else                                    // ===== Heltec V4 TFT (default) =====
   #define CAP_TOUCH        1   // capacitive touch panel
   #define CAP_ROTATABLE    1   // user can flip portrait/landscape
