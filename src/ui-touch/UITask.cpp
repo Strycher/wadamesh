@@ -3681,6 +3681,20 @@ static volatile bool s_sdinfo_request  = false;  // UI -> worker: rescan SD usag
 static volatile bool s_hist_flush_req  = false;  // snapshot armed, waiting for the worker
 static volatile bool s_hist_flush_busy = false;  // worker owns the snapshot + the history file
 static volatile bool s_hist_flush_ok   = true;   // last worker write result (retry on false)
+// #22/#20: exponential backoff on PERSISTENT thread-metadata write failure (no
+// card / full fs). A failing write must not re-fire on a fixed 2 s cadence — on
+// CrowPanel7 every flash write whites the panel (a flash erase disables the shared
+// flash/PSRAM cache, starving the DSI framebuffer). Reset to 0 on the next success.
+// The message-ring paths keep their existing re-arm: on CrowPanel7 msgs go through
+// the core-0 worker, whose success is not observable here, so backing it off
+// correctly needs a worker-side reset — a scoped follow-up (see flushHistoryIfDue).
+static uint32_t s_threads_flush_backoff_ms = 0;
+static constexpr uint32_t HIST_FLUSH_BACKOFF_BASE_MS = 2000;
+static constexpr uint32_t HIST_FLUSH_BACKOFF_CAP_MS  = 30000;   // cap the loss window
+static inline uint32_t histFlushBackoffNext(uint32_t cur) {
+  uint32_t next = cur ? cur * 2u : HIST_FLUSH_BACKOFF_BASE_MS;
+  return next > HIST_FLUSH_BACKOFF_CAP_MS ? HIST_FLUSH_BACKOFF_CAP_MS : next;
+}
 static bool uiHistWorkerFlush();                 // defined with the storage code below
 static volatile bool s_sdinfo_done     = false;  // worker -> UI: a result exists
 static volatile bool s_sdinfo_ok       = false;  // card present + sizes valid
@@ -34367,6 +34381,10 @@ static uint32_t      s_hist_snap_msgcount = 0;
 
 void UITask::flushHistoryIfDue(unsigned long now) {
   // A worker write failed (storage hiccup): re-arm and try again.
+  // NOTE (#22): the worker-path re-arm is NOT backed off here — worker success is
+  // not observable in this function, so a per-call reset would defeat escalation.
+  // Backing this path off correctly needs a worker-side reset (volatile) and is a
+  // deliberate follow-up. This 5 s re-fire is the pre-existing behaviour, unchanged.
   if (!s_hist_flush_ok) { s_hist_flush_ok = true; markMsgsDirty(5000); }
   // Thread metadata (~4 KB) flushes on a short delay; the message ring
   // (scales with MAX_UI_MESSAGES) flushes lazily to reduce flash write pressure.
@@ -34374,9 +34392,18 @@ void UITask::flushHistoryIfDue(unsigned long now) {
     if (s_hist_flush_busy) {
       // The worker is mid-write on the same filesystem; SPIFFS serializes
       // internally, so writing now would block the loop behind its GC. Defer.
+      // (No write happens here — no panel blink — so a short fixed defer is fine.)
       _next_threads_flush_ms = now + 1000;
-    } else if (saveThreadsToStorage()) _threads_dirty = false;
-    else _next_threads_flush_ms = now + 2000;
+    } else if (saveThreadsToStorage()) {
+      _threads_dirty = false;
+      s_threads_flush_backoff_ms = 0;   // #22: success clears the backoff
+    } else {
+      // #22/#20: persistent write failure (no card / full fs). Back off
+      // exponentially — a fixed 2 s re-fire would strobe the panel with a flash
+      // write on every attempt. Cleared on success above.
+      s_threads_flush_backoff_ms = histFlushBackoffNext(s_threads_flush_backoff_ms);
+      _next_threads_flush_ms = now + s_threads_flush_backoff_ms;
+    }
   }
   if (_msgs_dirty && now >= _next_msgs_flush_ms) {
     if (s_hist_flush_busy || s_hist_flush_req) {
