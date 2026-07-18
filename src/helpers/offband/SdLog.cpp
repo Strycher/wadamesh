@@ -44,6 +44,16 @@ bool sdLogBegin() {
   // and one fs::FS object: this logger keeps writing /sdcard/wadamesh.log over the
   // same VFS path, and the UI chat-history store reuses &SD_MMC (uiDataFsReady).
   // No card -> SD_MMC.begin returns false; we degrade cleanly (never hang boot).
+  // CRITICAL (dead-panel regression, 2026-07-18): the esp32p4 Arduino variant
+  // defines BOARD_SDMMC_POWER_CHANNEL 4, so SD_MMC.begin() would acquire on-chip
+  // LDO channel 4 = VO4 (SD_MMC.cpp: _power_channel -> sd_pwr_ctrl_new_on_chip_ldo).
+  // VO4 is the SAME rail CrowPanel7Display needs for the GPIO39-48 bank
+  // (CP7_LDO_IOBANK_CHAN 4). We mount BEFORE display.begin(), so SD grabbing VO4
+  // first made the display's acquire fail and left the panel unpowered.
+  // -1 = "externally powered": SD_MMC skips the LDO acquire and rides the rail
+  // periman + the display already hold up. This mirrors what the previous raw-IDF
+  // mount did deliberately (it passed no pwr_ctrl_handle for exactly this reason).
+  SD_MMC.setPowerChannel(-1);
   SD_MMC.setPins(kSdClk, kSdCmd, kSdD0);
   if (!SD_MMC.begin(kMountPoint, true /*mode1bit*/) || SD_MMC.cardType() == CARD_NONE) {
     snprintf(s_status, sizeof s_status, "no card");
