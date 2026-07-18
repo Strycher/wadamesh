@@ -37346,7 +37346,14 @@ void UITask::loop() {
   { static unsigned long s_floor_due = 0;
     if (now >= s_floor_due) {
       s_floor_due = now + 15UL * 60UL * 1000UL;
-      touchPrefsSetClockFloor(rtc_clock.getFloor());   // no-op unless it grew
+      // #20 INSTRUMENTATION (diagnostic only): mark the 15-min tick so serial shows
+      // tick-vs-actual-write. The "no-op unless it grew" comment below is
+      // misleading — ClockFloorRTC::getCurrentTime() ratchets _floor to wall clock
+      // on every call, so the floor DOES grow and this normally does write. A
+      // [PREFSW] line right after this tick = an internal-flash write = a panel flash.
+      const uint32_t _cf = rtc_clock.getFloor();
+      Serial.printf("[FLOORTICK] floor=%lu @%lu\n", (unsigned long)_cf, (unsigned long)now);
+      touchPrefsSetClockFloor(_cf);   // writes only when the floor actually grew
     } }
 #endif
 #if defined(DOC_CAPTURE)

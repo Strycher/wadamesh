@@ -202,11 +202,26 @@ static void cfgSetDefaults(TouchCfg& c) {
 // Persist the whole blob using the same end()/begin(RW)/put/end()/begin(RO)
 // discipline every setter in this file uses. Returns true on a durable write.
 static bool cfgFlush() {
+  const uint32_t _pw_t0 = millis();
   s_prefs.end();
-  if (!s_prefs.begin(TOUCH_NS, false)) { s_begun = false; return false; }
+  if (!s_prefs.begin(TOUCH_NS, false)) {
+    s_begun = false;
+    Serial.printf("[PREFSW] cfg BEGIN-FAILED @%lu\n", (unsigned long)_pw_t0);
+    return false;
+  }
   bool ok = s_prefs.putBytes(KEY_CFG, &s_cfg, sizeof(s_cfg)) == sizeof(s_cfg);
   s_prefs.end();
   s_begun = s_prefs.begin(TOUCH_NS, true);
+  // #20 INSTRUMENTATION (diagnostic only, no behaviour change): this is the single
+  // choke point for every touch-prefs blob write — settings changes AND the 15-min
+  // clock-floor persist. On the NVS backend that is an INTERNAL-FLASH write, which
+  // briefly whites the CrowPanel7 panel (flash erase disables the shared
+  // flash/PSRAM cache). Logged with millis + duration so the idle flash cadence can
+  // be measured from serial instead of inferred. Rate is inherently low (a write is
+  // the thing being measured), so this cannot flood the pipe (SAFELANE 11.10).
+  Serial.printf("[PREFSW] cfg %uB ok=%d %lums @%lu\n",
+                (unsigned)sizeof(s_cfg), ok ? 1 : 0,
+                (unsigned long)(millis() - _pw_t0), (unsigned long)_pw_t0);
   return ok;
 }
 
