@@ -18749,6 +18749,18 @@ static void makeHome(lv_obj_t* tab) {
   lv_obj_set_style_radius(s_home_sd_warn, 6, LV_PART_MAIN);
   lv_label_set_text(s_home_sd_warn, "");
   lv_obj_add_flag(s_home_sd_warn, LV_OBJ_FLAG_HIDDEN);
+  // Set the boot state HERE rather than waiting on refreshStatusLabels(): with no
+  // card, history falls back to internal flash and saveThreadsToStorage() blocks
+  // the loop 1.1-2.7 s per write (measured), starving the very refresh that would
+  // draw this banner. Observed exactly that — the warning never appeared on a
+  // no-card boot. Drawing it at creation makes it visible even when degraded.
+  if (!offband::sdLogAvailable()) {
+    lv_label_set_text(s_home_sd_warn, "No TF card - using internal storage (screen may flash)");
+    lv_obj_set_width(s_home_sd_warn, LV_PCT(90));   // cw/RSTRIP not in scope yet here
+    lv_obj_align(s_home_sd_warn, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_obj_clear_flag(s_home_sd_warn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_home_sd_warn);
+  }
 #endif
 
   // Content width = screen width minus the 10-px tab padding on each side.
