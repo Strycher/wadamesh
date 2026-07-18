@@ -77,6 +77,8 @@
   #include <FFat.h>            // the file browser + DataStore use the internal 'locfd' FAT partition
   #include <SD_MMC.h>          // microSD on the P4's SDMMC slot 0 (IOMUX 43/44/39-42); slot 1 = C6 radio
   extern bool g_fs_ok;         // set in main.cpp once FFat(locfd) is mounted
+#elif defined(HAS_CROWPANEL7)
+  #include <SD_MMC.h>          // #25: chat history persists to the microSD (mounted by offband::sdLogBegin)
 #endif
 #include <Utils.h>
 #include <LvglPsramAlloc.h>   // PSRAM-preferred alloc helpers for the map tile cache
@@ -111,6 +113,7 @@
     #include <Preferences.h>
     #include <helpers/esp32/SdNvsPrefs.h>   // NVS-or-SD prefs backend (Launcher-safe)
     #include "helpers/esp32/WdtHeavyGuard.h" // shared ref-counted core-0 WDT suspend (history/backup saves + core saveContacts)
+    #include "helpers/offband/SdLog.h"       // #25: sdLogAvailable() gates CrowPanel7 chat-history routing to SD_MMC
     // QUOTED on purpose: the vendored core lib ships a STALE copy of this header in
     // its include path, so an angle include picks that up and misses accessors we
     // add here (e.g. the signal-probe prefs). Quotes force the local src/ copy.
@@ -34462,6 +34465,28 @@ static bool uiDataFsReady() {
   }
   extern bool g_fs_ok;
   if (g_fs_ok) { s_ui_data_fs = &FFat; s_ui_data_root[0] = '\0'; return true; }
+#elif defined(HAS_CROWPANEL7)
+  // CrowPanel7 (#25): persist chat history to the microSD card, NOT internal flash.
+  // Every internal-flash write briefly whites the DSI panel (a flash erase disables
+  // the shared flash/PSRAM cache, starving the framebuffer — #20); the SD card is a
+  // separate peripheral, so writing it never blinks the screen. The card is mounted
+  // once at boot by offband::sdLogBegin() via SD_MMC; reuse that &SD_MMC here at the
+  // T-Deck-style /meshcomod root. No card -> fall through to SPIFFS (still works,
+  // just flashes on write) so history is never silently lost.
+  if (offband::sdLogAvailable()) {
+    SD_MMC.mkdir("/meshcomod");                 // no-op if it already exists
+    if (SD_MMC.exists("/meshcomod")) {          // review: don't claim SD silently if unwritable
+      s_ui_data_fs = &SD_MMC;
+      strncpy(s_ui_data_root, "/meshcomod", sizeof s_ui_data_root - 1);
+      return true;
+    }
+    // Card mounted but /meshcomod not creatable (read-only / corrupt FS) — fall
+    // through to SPIFFS rather than silently failing every history write.
+  }
+  if (SPIFFS.begin(false) || SPIFFS.begin(true)) {
+    s_ui_data_fs = &SPIFFS; s_ui_data_root[0] = '\0';
+    return true;
+  }
 #elif defined(HAS_TDECK_GT911)
   // T-Deck: the SD card is the persistent user-data store (large, removable,
   // survives a reflash) and is where chat history already lives. Prefer it; only
