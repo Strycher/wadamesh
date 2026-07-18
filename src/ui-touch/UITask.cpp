@@ -14721,6 +14721,19 @@ static lv_obj_t* s_home_chart_legend = nullptr;
 static lv_obj_t* s_home_chart_sig    = nullptr;   // live signal chip drawn inside the graph box
 #if CAP_LARGE_SCREEN
 static lv_obj_t* s_home_info         = nullptr;   // Commander info-panel values column (big screen) — refreshed live
+#if defined(HAS_CROWPANEL7)
+// Persistent storage-state banner on Home (#20/#26). SAFELANE §6: storage
+// degradation must be VISIBLE, not silent — and it must persist while the
+// condition holds, not flash past as a toast. Two states:
+//   no card at boot  -> history falls back to internal flash: still saved, but
+//                       the panel flashes on every write and the ring is 500
+//                       instead of 5000.
+//   card lost (write failed after a good mount) -> writes are FAILING; new
+//                       messages are NOT being persisted. This is the dangerous
+//                       one and stays until TF hot-plug recovery lands (#26).
+static lv_obj_t* s_home_sd_warn      = nullptr;
+static bool      s_sd_write_failed   = false;   // set by the history-flush failure path
+#endif
 #endif
 
 static void heartbeatAnimOpa(void* var, int32_t v) {
@@ -18721,6 +18734,22 @@ static void makeHome(lv_obj_t* tab) {
   lv_obj_set_scroll_dir(tab, LV_DIR_NONE);
   lv_obj_set_scrollbar_mode(tab, LV_SCROLLBAR_MODE_OFF);
   lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+
+#if defined(HAS_CROWPANEL7)
+  // Persistent storage-state banner (#20/#26). Created hidden; shown/worded by
+  // refreshStatusLabels() while the condition holds. Aligned bottom-centre so it
+  // sits clear of the chart/info card and never covers live data.
+  s_home_sd_warn = lv_label_create(tab);
+  lv_label_set_long_mode(s_home_sd_warn, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_font(s_home_sd_warn, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(s_home_sd_warn, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(s_home_sd_warn, lv_color_hex(0xE8B23A), LV_PART_MAIN);  // amber = degraded
+  lv_obj_set_style_bg_opa(s_home_sd_warn, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(s_home_sd_warn, 6, LV_PART_MAIN);
+  lv_obj_set_style_radius(s_home_sd_warn, 6, LV_PART_MAIN);
+  lv_label_set_text(s_home_sd_warn, "");
+  lv_obj_add_flag(s_home_sd_warn, LV_OBJ_FLAG_HIDDEN);
+#endif
 
   // Content width = screen width minus the 10-px tab padding on each side.
   // Tracks rotation (220 portrait / 300 landscape).
@@ -31389,6 +31418,24 @@ static void relayoutHomeCharts() {
     lv_obj_set_pos(s_home_chart, 0, legend_y + 16);
   }
 
+#if defined(HAS_CROWPANEL7)
+  // Storage-state banner (#20/#26) — persists while degraded (SAFELANE §6).
+  if (s_home_sd_warn) {
+    const char* warn = nullptr;
+    if (s_sd_write_failed)              warn = "TF card lost - messages are NOT being saved";
+    else if (!offband::sdLogAvailable()) warn = "No TF card - using internal storage (screen may flash)";
+    if (warn) {
+      lv_label_set_text(s_home_sd_warn, warn);
+      lv_obj_set_width(s_home_sd_warn, chart_w);
+      lv_obj_align(s_home_sd_warn, LV_ALIGN_BOTTOM_MID, 0, -2);
+      lv_obj_clear_flag(s_home_sd_warn, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_move_foreground(s_home_sd_warn);
+    } else {
+      lv_obj_add_flag(s_home_sd_warn, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+#endif
+
   if (s_home_adv_btn && !home_land) {
     lv_obj_set_pos(s_home_adv_btn, 0, legend_y + 16 + chart_h + 8);
     lv_obj_set_width(s_home_adv_btn, cw);
@@ -34400,7 +34447,16 @@ void UITask::flushHistoryIfDue(unsigned long now) {
     } else if (saveThreadsToStorage()) {
       _threads_dirty = false;
       s_threads_flush_backoff_ms = 0;   // #22: success clears the backoff
+#if defined(HAS_CROWPANEL7)
+      s_sd_write_failed = false;        // a write got through — clear the banner
+#endif
     } else {
+#if defined(HAS_CROWPANEL7)
+      // #20/#26: a write failed after a good mount = the card is gone/unwritable.
+      // Surface it on Home instead of losing messages silently (SAFELANE §6).
+      // Cleared by the next successful write (e.g. after the card is re-seated).
+      if (offband::sdLogAvailable()) s_sd_write_failed = true;
+#endif
       // #22/#20: persistent write failure (no card / full fs). Back off
       // exponentially — a fixed 2 s re-fire would strobe the panel with a flash
       // write on every attempt. Cleared on success above.
