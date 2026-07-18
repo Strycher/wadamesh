@@ -63,6 +63,8 @@ static uint32_t _atoi(const char* sp) {
     #ifndef PIN_SD_CS
       #define PIN_SD_CS 39      // T-Deck microSD chip-select
     #endif
+  #elif defined(HAS_CROWPANEL7)
+    #include <SD_MMC.h>   // #27: churn-heavy contacts/channels ride the TF card
   #endif
   extern "C" void set_boot_phase(int phase);
   namespace { struct MainBootTrace { MainBootTrace() { set_boot_phase(2); } } _main_boot_trace; }
@@ -518,6 +520,23 @@ void setup() {
         Serial.println("[BOOT] contacts/channels -> SD card (identity/prefs stay on SPIFFS)");
       }
     }
+  }
+#elif defined(HAS_CROWPANEL7)
+  // CrowPanel7 (#27): same churn problem as the T-Deck branch above, different
+  // symptom. Every internal-flash write briefly whites the DSI panel (a flash
+  // erase disables the shared flash/PSRAM cache, starving the framebuffer — #20),
+  // and the DataStore rewrites contacts/channels constantly. Route just those to
+  // the TF card; identity + prefs deliberately STAY on internal flash, so the node
+  // identity never changes and the device is safe if the card is pulled.
+  // DataStore::begin() -> migrateToSecondaryFS() copies the existing SPIFFS
+  // contacts/channels across once, so the contact list is preserved.
+  // The card is already mounted at boot by offband::sdLogBegin() (SD_MMC), so no
+  // mount ladder is needed here — just check it came up.
+  if (offband::sdLogAvailable()) {
+    store.setSecondaryFS(&SD_MMC);
+    Serial.println("[BOOT] contacts/channels -> SD card (identity/prefs stay on SPIFFS)");
+  } else {
+    Serial.println("[BOOT] no TF card — contacts/channels stay on internal flash (panel will flash on writes)");
   }
 #endif
   if (!sd_storage && !spiffs_ok) SPIFFS.begin(true);   // last resort: format SPIFFS
