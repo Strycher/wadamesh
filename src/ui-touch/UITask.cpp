@@ -3699,6 +3699,21 @@ static inline uint32_t histFlushBackoffNext(uint32_t cur) {
   return next > HIST_FLUSH_BACKOFF_CAP_MS ? HIST_FLUSH_BACKOFF_CAP_MS : next;
 }
 static bool uiHistWorkerFlush();                 // defined with the storage code below
+// #22: thread-metadata flush, offloaded to the same core-0 worker as the message
+// ring. Measured on device: saveThreadsToStorage() on the loop thread blocked
+// 1.1-2.7 s per write once history fell back to internal flash, starving the UI
+// hard enough that even the storage warning banner could not draw. The loop now
+// SERIALISES the 48-slot table into this snapshot (pure memcpy, no I/O) and the
+// worker does the file write — same no-shared-live-state contract as the ring,
+// so the worker never reads _ui_threads[] while the loop mutates it.
+static volatile bool   s_threads_flush_req        = false;
+static volatile bool   s_threads_flush_busy       = false;
+static volatile bool   s_threads_flush_ok         = true;
+static UiHistoryThread s_threads_snap[UITask::MAX_UI_THREADS];
+static int16_t         s_threads_snap_active_idx  = -1;
+static uint8_t         s_threads_snap_active_isch = 0;
+static bool uiThreadsWorkerFlush();              // defined with the storage code below
+static void serializeThreadsInto(UiHistoryThread* out, const UITask::UIThread* threads);
 static volatile bool s_sdinfo_done     = false;  // worker -> UI: a result exists
 static volatile bool s_sdinfo_ok       = false;  // card present + sizes valid
 static uint64_t      s_sdinfo_tot      = 0;
@@ -14732,7 +14747,9 @@ static lv_obj_t* s_home_info         = nullptr;   // Commander info-panel values
 //                       messages are NOT being persisted. This is the dangerous
 //                       one and stays until TF hot-plug recovery lands (#26).
 static lv_obj_t* s_home_sd_warn      = nullptr;
-static bool      s_sd_write_failed   = false;   // set by the history-flush failure path
+static volatile bool s_sd_write_failed = false;  // WRITTEN BY THE CORE-0 WORKER from the
+                                                 // real write result, read by the loop/UI —
+                                                 // volatile is required (#22 made it async)
 #endif
 #endif
 
@@ -20798,6 +20815,24 @@ static void tileFetchTaskFn(void* arg) {
       s_hist_flush_req  = false;
       s_hist_flush_ok   = uiHistWorkerFlush();
       s_hist_flush_busy = false;
+      continue;
+    }
+    // #22: thread-metadata flush — same contract as the ring above (busy raised
+    // BEFORE req is cleared, so the loop-side gate never sees a gap in which it
+    // could rewrite the snapshot mid-write). This is what keeps the 1.1-2.7 s
+    // storage write off the loop thread so the UI stays responsive.
+    if (s_threads_flush_req) {
+      s_threads_flush_busy = true;
+      s_threads_flush_req  = false;
+      s_threads_flush_ok   = uiThreadsWorkerFlush();
+#if defined(HAS_CROWPANEL7)
+      // #20/#26: the Home banner tracks the REAL last write result. A failure after
+      // a good mount means the card is gone/unwritable and messages are no longer
+      // being persisted — surface it rather than lose them silently (SAFELANE §6).
+      // Clears itself as soon as a write succeeds (e.g. the card is re-seated).
+      if (offband::sdLogAvailable()) s_sd_write_failed = !s_threads_flush_ok;
+#endif
+      s_threads_flush_busy = false;
       continue;
     }
     // Firmware update check (one-shot, infrequent). Reuses this worker's stack.
@@ -34448,32 +34483,35 @@ void UITask::flushHistoryIfDue(unsigned long now) {
   // Backing this path off correctly needs a worker-side reset (volatile) and is a
   // deliberate follow-up. This 5 s re-fire is the pre-existing behaviour, unchanged.
   if (!s_hist_flush_ok) { s_hist_flush_ok = true; markMsgsDirty(5000); }
+  // #22: the thread write is ASYNC now, so its result arrives here rather than as
+  // a return value. A failed worker write backs off (never a fixed re-fire — that
+  // would strobe the panel, #20) and re-arms. The Home banner flag is maintained by
+  // the worker itself so it always reflects the real last write result.
+  if (!s_threads_flush_ok) {
+    s_threads_flush_ok = true;
+    s_threads_flush_backoff_ms = histFlushBackoffNext(s_threads_flush_backoff_ms);
+    _threads_dirty = true;                                    // retry this write
+    _next_threads_flush_ms = now + s_threads_flush_backoff_ms;
+  }
   // Thread metadata (~4 KB) flushes on a short delay; the message ring
   // (scales with MAX_UI_MESSAGES) flushes lazily to reduce flash write pressure.
   if (_threads_dirty && now >= _next_threads_flush_ms) {
-    if (s_hist_flush_busy) {
-      // The worker is mid-write on the same filesystem; SPIFFS serializes
-      // internally, so writing now would block the loop behind its GC. Defer.
-      // (No write happens here — no panel blink — so a short fixed defer is fine.)
+    if (s_hist_flush_busy || s_threads_flush_busy || s_threads_flush_req) {
+      // A worker write is in flight (or one is already armed) — arming now would
+      // rewrite the snapshot underneath it. Defer; no write happens here, so no
+      // panel blink, and a short fixed defer is fine.
       _next_threads_flush_ms = now + 1000;
-    } else if (saveThreadsToStorage()) {
-      _threads_dirty = false;
-      s_threads_flush_backoff_ms = 0;   // #22: success clears the backoff
-#if defined(HAS_CROWPANEL7)
-      s_sd_write_failed = false;        // a write got through — clear the banner
-#endif
     } else {
-#if defined(HAS_CROWPANEL7)
-      // #20/#26: a write failed after a good mount = the card is gone/unwritable.
-      // Surface it on Home instead of losing messages silently (SAFELANE §6).
-      // Cleared by the next successful write (e.g. after the card is re-seated).
-      if (offband::sdLogAvailable()) s_sd_write_failed = true;
-#endif
-      // #22/#20: persistent write failure (no card / full fs). Back off
-      // exponentially — a fixed 2 s re-fire would strobe the panel with a flash
-      // write on every attempt. Cleared on success above.
-      s_threads_flush_backoff_ms = histFlushBackoffNext(s_threads_flush_backoff_ms);
-      _next_threads_flush_ms = now + s_threads_flush_backoff_ms;
+      // #22: hand the write to the core-0 worker. Serialising the 48-slot table is
+      // a pure memcpy on the loop thread (microseconds); the 1.1-2.7 s file write
+      // now happens off-loop, so the UI no longer freezes on every flush — which is
+      // also what stopped the storage banner drawing when it was needed most.
+      serializeThreadsInto(s_threads_snap, _ui_threads);
+      s_threads_snap_active_idx  = static_cast<int16_t>(_active_thread_idx);
+      s_threads_snap_active_isch = _active_thread_is_channel ? 1u : 0u;
+      s_threads_flush_req = true;   // worker picks it up
+      _threads_dirty = false;
+      s_threads_flush_backoff_ms = 0;   // armed cleanly; re-set by the failure path
     }
   }
   if (_msgs_dirty && now >= _next_msgs_flush_ms) {
@@ -34847,8 +34885,12 @@ bool UITask::loadHistoryFromStorage() {
 #endif
 }
 
-bool UITask::saveThreadsToStorage() {
 #if defined(ESP32)
+// #22: the actual file write, taking an ALREADY-SERIALISED table. Callable from
+// either thread because it touches no live UI state — the loop-side snapshot
+// (worker path) and the synchronous shutdown path both funnel through here.
+static bool uiWriteThreadsFile(const UiHistoryThread* threads,
+                               int16_t active_idx, uint8_t active_is_channel) {
   WdtHeavyGuard _wg;
   File f = uiDataOpen(k_ui_threads_path, "w");
   if (!f) return false;
@@ -34857,14 +34899,38 @@ bool UITask::saveThreadsToStorage() {
   hdr.magic                 = k_ui_threads_magic;
   hdr.version               = k_ui_history_version;
   hdr.thread_rec_size       = static_cast<uint16_t>(sizeof(UiHistoryThread));
-  hdr.active_thread_idx     = static_cast<int16_t>(_active_thread_idx);
-  hdr.active_thread_is_channel = _active_thread_is_channel ? 1u : 0u;
+  hdr.active_thread_idx     = active_idx;
+  hdr.active_thread_is_channel = active_is_channel;
   if (f.write(reinterpret_cast<const uint8_t*>(&hdr), sizeof(hdr)) != sizeof(hdr)) {
     f.close(); return false;
   }
+  for (int i = 0; i < UITask::MAX_UI_THREADS; ++i) {
+    if (f.write(reinterpret_cast<const uint8_t*>(&threads[i]), sizeof(UiHistoryThread))
+        != sizeof(UiHistoryThread)) {
+      f.close(); return false;
+    }
+  }
+  f.close();
+  return true;
+}
 
-  UiHistoryThread t{};
-  for (int i = 0; i < MAX_UI_THREADS; ++i) {
+// Worker entry: write the snapshot the loop armed. Never reads live UI state.
+static bool uiThreadsWorkerFlush() {
+  return uiWriteThreadsFile(s_threads_snap,
+                            s_threads_snap_active_idx, s_threads_snap_active_isch);
+}
+#endif
+
+// Serialise the LIVE thread table into `out` (48 records). Loop-thread only —
+// this is the cheap half (no I/O); the file write is what gets offloaded.
+// #22: serialise the live 48-slot thread table into on-disk records. File-static
+// (not a UITask member) on purpose: UiHistoryThread lives in this .cpp's ANONYMOUS
+// namespace, so it cannot be named from UITask.h — declaring a member that takes it
+// creates a second, distinct type and every reference becomes ambiguous.
+// Loop-thread only; the file write is what gets offloaded to the core-0 worker.
+static void serializeThreadsInto(UiHistoryThread* out, const UITask::UIThread* _ui_threads) {
+  for (int i = 0; i < UITask::MAX_UI_THREADS; ++i) {
+    UiHistoryThread& t = out[i];
     memset(&t, 0, sizeof(t));
     t.used               = _ui_threads[i].used ? 1u : 0u;
     t.channel            = _ui_threads[i].channel ? 1u : 0u;
@@ -34874,14 +34940,23 @@ bool UITask::saveThreadsToStorage() {
     memcpy(t.mesh_contact_pub,  _ui_threads[i].mesh_contact_pub,  sizeof(t.mesh_contact_pub));
     memcpy(t.mesh_contact_key6, _ui_threads[i].mesh_contact_key6, sizeof(t.mesh_contact_key6));
     t.mesh_channel_slot  = _ui_threads[i].mesh_channel_slot;
-    strncpy(t.name, _ui_threads[i].name, MAX_THREAD_NAME);
-    t.name[MAX_THREAD_NAME] = '\0';
-    if (f.write(reinterpret_cast<const uint8_t*>(&t), sizeof(t)) != sizeof(t)) {
-      f.close(); return false;
-    }
+    strncpy(t.name, _ui_threads[i].name, UITask::MAX_THREAD_NAME);
+    t.name[UITask::MAX_THREAD_NAME] = '\0';
   }
-  f.close();
-  return true;
+}
+
+bool UITask::saveThreadsToStorage() {
+#if defined(ESP32)
+  // Synchronous write of the LIVE table — shutdown/reboot only; the periodic
+  // flush goes through the worker snapshot (mirrors saveMsgsToStorage).
+  // We reuse s_threads_snap as the scratch buffer, so wait out any in-flight
+  // worker write first — otherwise this would rewrite the buffer underneath it.
+  // Bounded (~1 s) so a wedged worker can never block shutdown.
+  for (int i = 0; i < 200 && s_threads_flush_busy; ++i) delay(5);
+  serializeThreadsInto(s_threads_snap, _ui_threads);
+  return uiWriteThreadsFile(s_threads_snap,
+                            static_cast<int16_t>(_active_thread_idx),
+                            _active_thread_is_channel ? 1u : 0u);
 #else
   return false;
 #endif
