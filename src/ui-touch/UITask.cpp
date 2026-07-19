@@ -14746,7 +14746,8 @@ static lv_obj_t* s_home_info         = nullptr;   // Commander info-panel values
 //   card lost (write failed after a good mount) -> writes are FAILING; new
 //                       messages are NOT being persisted. This is the dangerous
 //                       one and stays until TF hot-plug recovery lands (#26).
-static lv_obj_t* s_home_sd_warn      = nullptr;
+// #29: the dedicated banner object is gone — this state is now the Home info
+// card's "Storage" row (see refreshStatusLabels). The flag below still drives it.
 static volatile bool s_sd_write_failed = false;  // WRITTEN BY THE CORE-0 WORKER from the
                                                  // real write result, read by the loop/UI —
                                                  // volatile is required (#22 made it async)
@@ -18752,33 +18753,17 @@ static void makeHome(lv_obj_t* tab) {
   lv_obj_set_scrollbar_mode(tab, LV_SCROLLBAR_MODE_OFF);
   lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
 
-#if defined(HAS_CROWPANEL7)
-  // Persistent storage-state banner (#20/#26). Created hidden; shown/worded by
-  // refreshStatusLabels() while the condition holds. Aligned bottom-centre so it
-  // sits clear of the chart/info card and never covers live data.
-  s_home_sd_warn = lv_label_create(tab);
-  lv_label_set_long_mode(s_home_sd_warn, LV_LABEL_LONG_WRAP);
-  lv_obj_set_style_text_font(s_home_sd_warn, &g_font_14, LV_PART_MAIN);
-  lv_obj_set_style_text_color(s_home_sd_warn, lv_color_hex(0x000000), LV_PART_MAIN);
-  lv_obj_set_style_bg_color(s_home_sd_warn, lv_color_hex(0xE8B23A), LV_PART_MAIN);  // amber = degraded
-  lv_obj_set_style_bg_opa(s_home_sd_warn, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_set_style_pad_all(s_home_sd_warn, 6, LV_PART_MAIN);
-  lv_obj_set_style_radius(s_home_sd_warn, 6, LV_PART_MAIN);
-  lv_label_set_text(s_home_sd_warn, "");
-  lv_obj_add_flag(s_home_sd_warn, LV_OBJ_FLAG_HIDDEN);
-  // Set the boot state HERE rather than waiting on refreshStatusLabels(): with no
-  // card, history falls back to internal flash and saveThreadsToStorage() blocks
-  // the loop 1.1-2.7 s per write (measured), starving the very refresh that would
-  // draw this banner. Observed exactly that — the warning never appeared on a
-  // no-card boot. Drawing it at creation makes it visible even when degraded.
-  if (!offband::sdLogAvailable()) {
-    lv_label_set_text(s_home_sd_warn, "No TF card - using internal storage (screen may flash)");
-    lv_obj_set_width(s_home_sd_warn, LV_PCT(90));   // cw/RSTRIP not in scope yet here
-    lv_obj_align(s_home_sd_warn, LV_ALIGN_BOTTOM_MID, 0, -2);
-    lv_obj_clear_flag(s_home_sd_warn, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(s_home_sd_warn);
-  }
-#endif
+  // #29: the storage-state banner used to be created here, before the info card.
+  // That ordering was the bug — the card is created later and therefore painted
+  // over it, so the warning drew but its text was unreadable. The state now lives
+  // as a "Storage" row inside the card itself (makeHome's info-panel block +
+  // refreshStatusLabels), which cannot be occluded and needs no z-order fight.
+  //
+  // Retained rationale from the original: the boot state must be visible without
+  // waiting on refreshStatusLabels(). With no card, history falls back to internal
+  // flash; before #22 that blocked the loop 1.1-2.7 s per write and starved the
+  // refresh entirely. The row is emitted by the same refresh, but #22 moved that
+  // write to the core-0 worker, so the refresh now runs and the row populates.
 
   // Content width = screen width minus the 10-px tab padding on each side.
   // Tracks rotation (220 portrait / 300 landscape).
@@ -19048,11 +19033,26 @@ static void makeHome(lv_obj_t* tab) {
     const lv_font_t* info_font = &g_font_12;
     const int info_card_h = home_avail - info_y - SC(8);
     const int info_fh     = lv_font_get_line_height(info_font);
-    int info_ls = (info_card_h - 16 - 8 * info_fh) / 7;   // pad_all=8 → -16
+    // #29: CrowPanel7 carries a 9th "Storage" row (TF-card state). The row count is
+    // BOARD-GATED, not screen-gated: this card is CAP_LARGE_SCREEN but the storage
+    // state (offband::sdLogAvailable / s_sd_write_failed) is HAS_CROWPANEL7 — a
+    // different board set. Deriving the spacing from a hardcoded 8 here while the
+    // value column emits 9 lines is what clips the last row off the bottom at Huge.
+#if defined(HAS_CROWPANEL7)
+    const int info_rows = 9;
+#else
+    const int info_rows = 8;
+#endif
+    int info_ls = (info_card_h - 16 - info_rows * info_fh) / (info_rows - 1);   // pad_all=8 → -16
     if (info_ls < 1) info_ls = 1;
     if (info_ls > 8) info_ls = 8;
     lv_obj_t* keys = lv_label_create(card);
-    lv_label_set_text(keys, "Node\nRegion\nRadio\nSignal\nContacts\nChannels\nBattery\nUptime");
+    lv_label_set_text(keys,
+#if defined(HAS_CROWPANEL7)
+        "Node\nRegion\nRadio\nSignal\nContacts\nChannels\nBattery\nUptime\nStorage");
+#else
+        "Node\nRegion\nRadio\nSignal\nContacts\nChannels\nBattery\nUptime");
+#endif
     lv_obj_set_style_text_color(keys, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
     lv_obj_set_style_text_font(keys, info_font, LV_PART_MAIN);
     lv_obj_set_style_text_line_space(keys, info_ls, LV_PART_MAIN);
@@ -31465,23 +31465,11 @@ static void relayoutHomeCharts() {
     lv_obj_set_pos(s_home_chart, 0, legend_y + 16);
   }
 
-#if defined(HAS_CROWPANEL7)
-  // Storage-state banner (#20/#26) — persists while degraded (SAFELANE §6).
-  if (s_home_sd_warn) {
-    const char* warn = nullptr;
-    if (s_sd_write_failed)              warn = "TF card lost - messages are NOT being saved";
-    else if (!offband::sdLogAvailable()) warn = "No TF card - using internal storage (screen may flash)";
-    if (warn) {
-      lv_label_set_text(s_home_sd_warn, warn);
-      lv_obj_set_width(s_home_sd_warn, chart_w);
-      lv_obj_align(s_home_sd_warn, LV_ALIGN_BOTTOM_MID, 0, -2);
-      lv_obj_clear_flag(s_home_sd_warn, LV_OBJ_FLAG_HIDDEN);
-      lv_obj_move_foreground(s_home_sd_warn);
-    } else {
-      lv_obj_add_flag(s_home_sd_warn, LV_OBJ_FLAG_HIDDEN);
-    }
-  }
-#endif
+  // #29: the floating storage banner that used to live here is gone. It was created
+  // before the info card and so lost the z-order to it — drawn, but with its text
+  // unreadable underneath the card. The state is now a "Storage" row INSIDE that
+  // card (see refreshStatusLabels), where it cannot be occluded. Still surfaced
+  // persistently while degraded (SAFELANE §6) — only the presentation changed.
 
   if (s_home_adv_btn && !home_land) {
     lv_obj_set_pos(s_home_adv_btn, 0, legend_y + 16 + chart_h + 8);
@@ -31659,9 +31647,25 @@ static void refreshStatusLabels() {
     const int      snr = the_mesh.uiSignalSnrQ4() / 4;
     const uint16_t mv  = g_lv.task->getBattMilliVolts();
     const uint32_t up  = millis() / 1000;
-    char val[224];
+#if defined(HAS_CROWPANEL7)
+    // #29: 9th row — TF-card state, replacing the floating banner that the info
+    // card covered (it was created before the card, so it lost the z-order and its
+    // text was unreadable). A row INSIDE the card cannot collide with the card.
+    // LV_SYMBOL_WARNING, not U+26A0: the built-in LVGL symbol set is present in
+    // these Montserrat fonts (used throughout this file), but Montserrat has no
+    // U+26A0 glyph and would render tofu.
+    const char* storage_state =
+        s_sd_write_failed              ? LV_SYMBOL_WARNING " TF lost - NOT saving"
+      : !offband::sdLogAvailable()     ? LV_SYMBOL_WARNING " Internal (may flash)"
+                                       : "TF card";
+#endif
+    char val[288];
     snprintf(val, sizeof val,
-        "%s\n%.3f MHz\nSF%u \xC2\xB7 BW%.0f \xC2\xB7 %ddBm\n%d dB\n%d\n%d\n%.2f V\n%uh %02um",
+        "%s\n%.3f MHz\nSF%u \xC2\xB7 BW%.0f \xC2\xB7 %ddBm\n%d dB\n%d\n%d\n%.2f V\n%uh %02um"
+#if defined(HAS_CROWPANEL7)
+        "\n%s"
+#endif
+        ,
         nm,
         pr ? (double)pr->freq : 0.0,
         pr ? (unsigned)pr->sf : 0u,
@@ -31670,7 +31674,11 @@ static void refreshStatusLabels() {
         snr,
         the_mesh.getNumContacts(), the_mesh.getNumChannels(),
         mv / 1000.0,
-        (unsigned)(up / 3600), (unsigned)((up % 3600) / 60));
+        (unsigned)(up / 3600), (unsigned)((up % 3600) / 60)
+#if defined(HAS_CROWPANEL7)
+        , storage_state
+#endif
+        );
     setLabelIfChanged(s_home_info, val);
   }
 #endif
