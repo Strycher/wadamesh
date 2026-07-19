@@ -24,6 +24,12 @@ platformio.local.ini
 # Local tile-pack build data + generated Wi-Fi creds (never commit)
 /data/
 scripts/build/wifi_secrets.h
+# Generated per-build by scripts/inject_version.py (version stamp + the pin/feature
+# defines moved off the Win32 command line). Board-specific and rewritten on every
+# build — tracking it kept the tree permanently dirty, forced a false "+d" onto
+# FIRMWARE_VERSION, and left one board's pin map committed on another board's
+# branch. Regenerated on every build on every machine; nothing to preserve. (#28)
+scripts/build/offband_patch_version.h
 
 # Local working notes + agent config (contain ops/infra details — never publish)
 CLAUDE.md
@@ -34,6 +40,11 @@ CLAUDE.md
 
 # Local reconstruction notes (scratch, never publish)
 /.notes/
+
+# Upstream Elecrow vendor reference material (schematics, C6 OTA bundle, STP/3D).
+# Not ours — kept on disk for reference and refreshed from the vendor as needed,
+# never committed to the fork. Owner ruling 2026-07-18. (#28)
+/docs/
 
 # --- ESP-IDF hybrid build artifacts (crowpanel7 env, #11) — all derived ---
 /CMakeLists.txt
