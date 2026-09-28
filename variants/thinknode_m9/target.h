@@ -2,6 +2,7 @@
 
 #define RADIOLIB_STATIC_ONLY 1
 #include "../../src/helpers/ClockFloorRTC.h" // monotonic send-timestamp floor (issue #89)
+#include "../../src/helpers/HardwareRtcClock.h" // PCF8563 retention across power-off (issue #383)
 #include "M9Board.h"
 #include <RadioLib.h>
 #include <helpers/AutoDiscoverRTCClock.h>
@@ -12,20 +13,28 @@
 #include <helpers/ui/ST7789LCDDisplay.h>
 #endif
 #include "helpers/sensors/EnvironmentSensorManager.h"
-#include "helpers/sensors/MicroNMEALocationProvider.h"
+// Wadamesh-owned NMEA provider (the core one plus speed/course for wada.sys.gps)
+#include "../../src/helpers/WadaNmeaLocationProvider.h"
 #if defined(HAS_M9_KEYBOARD)
 #include "M9Keyboard.h"
+#endif
+#if defined(HAS_M9_COMPASS)
+#include "M9Compass.h"
+#endif
+#if defined(HAS_M9_IMU)
+#include "M9Imu.h"
 #endif
 
 extern ThinkNodeM9Board board;
 extern WRAPPER_CLASS radio_driver;
 extern RADIO_CLASS radio;
+extern HardwareRtcClock hw_rtc;   // the board's PCF8563; ClockFloorRTC's fallback
 extern ClockFloorRTC rtc_clock;
 extern EnvironmentSensorManager sensors;
 
 #ifdef DISPLAY_CLASS
 extern DISPLAY_CLASS display;
-extern MomentaryButton user_btn;
+// (no user_btn: the M9 has no user/BOOT button — see target.cpp)
 #endif
 
 bool radio_init();
@@ -37,4 +46,7 @@ mesh::LocalIdentity radio_new_identity();
 // hands that same instance to SD.begin().
 SPIClass *m9SharedSPI();
 
-void m9SetBacklight(bool on);
+// Speed/course over ground from the GPS for the Lua host (HAS_GPS_MOTION).
+// Plain function so UITask.cpp needs no provider type: false = no fix / no
+// RMC yet; course_deg is NAN while not moving (see WadaNmeaLocationProvider).
+bool wadaGpsMotion(float *speed_kmh, float *course_deg);

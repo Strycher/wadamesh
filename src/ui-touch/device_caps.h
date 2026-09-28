@@ -25,7 +25,27 @@
 // =============================================================================
 
 // ---- Per-board structural capabilities (factored out of the device names) ----
-#if defined(HAS_TDECK_GT911)            // ===== LilyGo T-Deck (ESP32-S3) =====
+#if defined(HAS_WIO_TRACKER_L2)          // ===== Seeed Wio Tracker L2 (ESP32-S3) =====
+  #define CAP_TOUCH        1
+  #define CAP_ROTATABLE    0
+  #define CAP_LARGE_SCREEN 0   // fixed 320x240 landscape
+  #define CAP_SD           0   // SD_MMC, not Arduino SD
+  #define CAP_FILESYSTEM   1
+  #define CAP_GPS          1
+  #define CAP_OTA          1
+  #define CAP_LOCK_SCREEN  1
+
+#elif defined(HAS_TDECK_PRO)             // ===== LilyGo T-Deck Pro (ESP32-S3) =====
+  #define CAP_TOUCH        1   // CST328 or CST3530 over I2C
+  #define CAP_ROTATABLE    0   // fixed portrait 240x320 e-paper panel
+  #define CAP_LARGE_SCREEN 0
+  #define CAP_SD           1   // microSD on the shared display/radio SPI bus
+  #define CAP_FILESYSTEM   1
+  #define CAP_GPS          1   // u-blox MIA-M10Q
+  #define CAP_OTA          1
+  #define CAP_LOCK_SCREEN  1
+
+#elif defined(HAS_TDECK_GT911)          // ===== LilyGo T-Deck (ESP32-S3) =====
   #define CAP_TOUCH        1   // capacitive touchscreen (pointer input)
   #define CAP_ROTATABLE    0   // panel is fixed landscape
   #define CAP_LARGE_SCREEN 0   // 320x240
@@ -33,6 +53,16 @@
   #define CAP_FILESYSTEM   1   // browsable filesystem (the SD card)
   #define CAP_GPS          1
   #define CAP_OTA          1   // native dual-OTA slot
+  #define CAP_LOCK_SCREEN  1
+
+#elif defined(TLORA_PAGER)              // ===== LilyGo T-LoRa Pager (ESP32-S3) =====
+  #define CAP_TOUCH        0   // no touchscreen — keyboard + rotary encoder nav only
+  #define CAP_ROTATABLE    0   // fixed 480x222 landscape via hardware MADCTL rotation
+  #define CAP_LARGE_SCREEN 0   // native 480x222, no UI upscaling
+  #define CAP_SD           1   // microSD on the shared display/radio SPI bus
+  #define CAP_FILESYSTEM   1   // browsable filesystem (the SD card)
+  #define CAP_GPS          1   // u-blox MIA-M10Q
+  #define CAP_OTA          1   // dual-OTA partition layout, same shape as the T-Deck
   #define CAP_LOCK_SCREEN  1
 
 #elif defined(HAS_TANMATSU)             // ===== Tanmatsu (ESP32-P4) =====
@@ -75,12 +105,62 @@
   // HELTEC_LORA_V4_TFT to reuse all its UI code); the deltas are 8 MB octal
   // PSRAM (→ web browser) and a micro-SD slot on the Expansion Kit V2.
   #define CAP_TOUCH        1   // CHSC6x capacitive touch (Expansion Kit V2)
-  #define CAP_ROTATABLE    1   // user can flip portrait/landscape
+  // Rotation is OFF until a tester verifies the R8-specific landscape touch
+  // maps (HeltecV4CapTouch.cpp, TESTER-VERIFY): the boot guard at UITask.cpp
+  // ("V4-R8: force PORTRAIT at every boot") reverts any landscape pref anyway,
+  // so with 1 the Orientation control was a reboot trap that always landed
+  // back on Portrait (plus one garbled session, since the boot wordmark had
+  // already rotated the panel). Flip back to 1 together with removing that
+  // guard once landscape touch is confirmed on hardware.
+  #define CAP_ROTATABLE    0
   #define CAP_LARGE_SCREEN 0   // 240x320
   #define CAP_SD           1   // micro-SD on Expansion Kit V2 (shared TFT SPI bus, CS=3)
   #define CAP_FILESYSTEM   1   // browsable filesystem (the SD card)
   #define CAP_GPS          1
   #define CAP_OTA          1   // native dual-OTA slot
+  // 0: no unlock gesture exists yet — touch is deliberately inert while
+  // hard-locked and BOOT already wake-unlocks in the generic branch. Enabling
+  // needs a reveal+hold-to-unlock input path plus the DSEC_LOCK row gates
+  // (see UITask.cpp lockScreen()/noteUserInput) — a feature, not a cap flip.
+  #define CAP_LOCK_SCREEN  0
+
+#elif defined(HAS_TDISPLAY_P4)        // ===== LilyGo T-Display P4 (ESP32-P4 + C6) =====
+  // Phone-class AMOLED handheld: RM69A10 MIPI-DSI 568x1232 portrait, HI8561 cap touch, SX1262,
+  // C6 Wi-Fi/BLE (esp-hosted), SD_MMC. 32 MB PSRAM — web browser fits easily.
+  #define CAP_TOUCH        1
+  // The MIPI-DSI panel cannot MADCTL-rotate, so landscape is LVGL's software
+  // rotation, exactly as the Tanmatsu does it on the same silicon. Opt-in from
+  // Settings, Display; portrait stays the default.
+  #define CAP_ROTATABLE    1
+  #define CAP_LARGE_SCREEN 1   // 568x1232 -> UI upscaling like the Tanmatsu
+  // CAP_SD gates the *Arduino SD* (shared-SPI) path used by the T-Deck/M9/R8. The P4's
+  // card is SD_MMC (slot 0), mounted in main.cpp and used as the DataStore backend —
+  // exposed to the UI via CAP_FILESYSTEM, exactly like the Tanmatsu's FFat. So CAP_SD=0
+  // here keeps the Arduino-`SD` UI blocks (battery-log-on-SD, WAV sounds, fm SD mount)
+  // compiled out; SD_MMC file-manager browsing can be wired via the filesystem path later.
+  #define CAP_SD           0
+  #define CAP_FILESYSTEM   1   // SD_MMC + internal FFat 'storage'
+  #define CAP_GPS          1   // L76K
+  #define CAP_OTA          1   // standalone dual-OTA app
+  // 0, for the same reason as the V4-R8 above: nothing here is wired. There is no
+  // way to REACH the lock (the control-center Lock button is HAS_TDECK_GT911-only,
+  // and the pager/Tanmatsu triggers are their own boards), no unlock gesture (every
+  // unlock path is a trackball / Vol- / d-pad / wake-button branch, and the on-screen
+  // hint falls through to "hold the trackball", which this board does not have), and
+  // the DSEC_LOCK settings body is gated to the T-Deck and M9 -- so declaring the cap
+  // only produced an empty Lock screen settings card (#451). Turning this back on is
+  // a feature: a touch reveal + hold-to-unlock path, a P4 hint string, and the
+  // DSEC_LOCK gates. Until then, do not advertise it.
+  #define CAP_LOCK_SCREEN  0
+
+#elif defined(ATTAKY_MESH_SERIES)
+  #define CAP_TOUCH        1
+  #define CAP_ROTATABLE    0
+  #define CAP_LARGE_SCREEN 0
+  #define CAP_SD           0
+  #define CAP_FILESYSTEM   0
+  #define CAP_GPS          1
+  #define CAP_OTA          1
   #define CAP_LOCK_SCREEN  0
 
 #else                                    // ===== Heltec V4 TFT (default) =====
@@ -94,25 +174,104 @@
   #define CAP_LOCK_SCREEN  0
 #endif
 
+// Physical removable microSD slot, independent of the filesystem API used to
+// drive it. CAP_SD specifically means Arduino SD over SPI; these three boards
+// use SD_MMC instead but still need the same user-facing card diagnostics.
+#if CAP_SD || defined(HAS_WIO_TRACKER_L2) || defined(HAS_TANMATSU) || defined(HAS_TDISPLAY_P4)
+  #define CAP_MICROSD 1
+#else
+  #define CAP_MICROSD 0
+#endif
+
+// Persisted, restart-to-apply UI-size selector. Large-screen boards already
+// expose it; the Pager, V4-R8 and ThinkNode M9 add font-only presets because
+// their compact viewports cannot safely take global geometry scaling.
+#if CAP_LARGE_SCREEN || defined(TLORA_PAGER) || defined(HELTEC_LORA_V4_R8) || defined(HAS_THINKNODE_M9)
+  #define CAP_UI_SIZE 1
+#else
+  #define CAP_UI_SIZE 0
+#endif
+
 // ---- Derived input capabilities ---------------------------------------------
-// Physical keyboard: T-Deck matrix OR Tanmatsu keypad OR ThinkNode M9 keyboard.
-#if defined(HAS_TDECK_KEYBOARD) || defined(HAS_TANMATSU) || defined(HAS_M9_KEYBOARD)
+// Physical keyboard: T-Deck matrix, Tanmatsu keypad, the pager's TCA8418, or
+// the ThinkNode M9 keyboard.
+#if defined(HAS_TDECK_KEYBOARD) || defined(HAS_TANMATSU) || defined(HAS_PAGER_KEYBOARD) || defined(HAS_M9_KEYBOARD)
   #define CAP_KEYBOARD 1
 #else
   #define CAP_KEYBOARD 0
 #endif
 
-// Focus-group D-pad navigation (no pointer): Tanmatsu keypad OR T-Deck trackball
-// OR the ThinkNode M9's d-pad. The underlying machinery (navFifo, navMoveDir,
-// the focus group, the secondary KEYPAD indev) is generic — only the *pump*
-// that feeds it differs per board: Tanmatsu's navPump() reads bsp-input events;
-// T-Deck's WASDZ-letter nav and the M9's raw d-pad bytes are both fed straight
-// from handleHwKey() instead (see UITask.cpp's `#elif defined(HAS_M9_KEYBOARD)`
-// block, parallel to the T-Deck's `#if CAP_TRACKBALL` block).
-#if defined(HAS_TANMATSU) || defined(HAS_TDECK_TRACKBALL) || defined(HAS_THINKNODE_M9)
+// External Bluetooth LE keyboard (BleKeyboard.cpp): needs NimBLE-Arduino's central
+// role, which every ESP32-S3 board's phone-app link already brings. Keyboard
+// boards route its keys through handleHwKey(); the others type into the bound
+// field and keep the on-screen keyboard down while it is connected. All of them
+// drive the focus group with its arrows, Enter and Esc. The P4 boards are out:
+// the T-Display P4's C6 firmware has no Bluetooth, and the Tanmatsu runs another
+// NimBLE wrapper.
+#if defined(BLE_PIN_CODE) && defined(MULTI_TRANSPORT_COMPANION) && \
+    !defined(HAS_TANMATSU) && !defined(HAS_TDISPLAY_P4)
+  #define CAP_BLE_KEYBOARD 1
+#else
+  #define CAP_BLE_KEYBOARD 0
+#endif
+
+// Focus-group D-pad navigation (no pointer): Tanmatsu keypad, T-Deck trackball,
+// the pager (no touch at all — the rotary encoder is its only nav input, so
+// like Tanmatsu this is always-on, not an optional toggle like the T-Deck's),
+// the ThinkNode M9's d-pad, or the Attaky's front D-pad + SELECT. The underlying
+// machinery (navFifo, navMoveDir, the focus group, the secondary KEYPAD indev)
+// is generic — only the *pump* that feeds it differs per board: Tanmatsu's
+// navPump() reads bsp-input events; T-Deck's WASDZ-letter nav and the M9's raw
+// d-pad bytes are both fed straight from handleHwKey() instead (see UITask.cpp's
+// `#elif defined(HAS_M9_KEYBOARD)` block, parallel to the T-Deck's `#if
+// CAP_TRACKBALL` block); the Attaky drains its expander queue in attakyNavPump().
+// NOTE: the Attaky is the first board here with CAP_KEYBOARD == 0, so anything
+// this flag pulls in must not assume a physical keyboard is also compiled.
+// Touchscreen-only boards that take a Bluetooth or CardKB keyboard join too:
+// the group stays empty (and invisible) until a keyboard connects.
+#if defined(HAS_TANMATSU) || defined(HAS_TDECK_TRACKBALL) || defined(HAS_TDECK_PRO) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(ATTAKY_MESH_SERIES) || \
+    defined(HAS_CARDKB) || (CAP_BLE_KEYBOARD && !CAP_KEYBOARD)
   #define CAP_KEYPAD_NAV 1
 #else
   #define CAP_KEYPAD_NAV 0
+#endif
+
+// Battery-backed clock that keeps wall time through a TRUE power-off (issue #383).
+// This is a DECLARED hardware fact, never "the generic 0x51 probe found something":
+// address-only auto-detection is what read the Pager's PCF85063A as a PCF8563, and
+// what let a chipless T-Deck look RTC-backed. A board earns a 1 here only when its
+// target.cpp drives a documented chip (HardwareRtcClock) or calls the core probe
+// against a chip the schematic confirms.
+//
+// 1 does NOT mean "the time is right": the chip's own integrity bit can say its
+// contents are untrustworthy after a power cut (the ThinkNode M9 report on #383),
+// and a dead backup cell reads the same way. That is a RUNTIME question — ask
+// rtc_clock.timeIsCurrent() / .source(), not this flag. Use this one for what is
+// physically fitted: diagnostics wording, and whether to probe at all.
+#if defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HAS_TDISPLAY_P4)
+  #define CAP_HARDWARE_RTC 1
+#else
+  #define CAP_HARDWARE_RTC 0
+#endif
+
+// A true power cut can leave these boards without trustworthy wall time. The
+// T-Deck has no RTC; the M9's PCF8563 can report lost integrity after shutdown.
+// Both can opt into the bounded, pre-transport saved-Wi-Fi sync from #383.
+#if defined(HAS_TDECK_GT911) || defined(HAS_TDECK_PRO) || defined(HAS_THINKNODE_M9)
+  #define CAP_BOOT_TIME_SYNC 1
+#else
+  #define CAP_BOOT_TIME_SYNC 0
+#endif
+
+// Round-cornered, tall/narrow phone-class panel (LilyGo T-Display P4, 568x1232). The
+// AMOLED corners are arcs, so content is inset from all four corners, and the very tall
+// aspect lets the status bar wrap to TWO rows (row 1 = name + clock, row 2 = the wifi/
+// ble/sd/signal/battery cluster) instead of cramming everything onto one narrow line.
+// Square-cornered panels leave this 0 and keep the single-row bar with no insets.
+#if defined(HAS_TDISPLAY_P4)
+  #define CAP_ROUND_CORNERS 1
+#else
+  #define CAP_ROUND_CORNERS 0
 #endif
 
 // ---- Capabilities aliased to existing device-neutral macros -----------------
@@ -123,10 +282,57 @@
   #define CAP_TRACKBALL 0
 #endif
 
+// Console mode (CONSOLE_MODE.md): a text front end drawn straight to the panel
+// with no LVGL. It does NOT imply the device boots into it; that is a user pref
+// read at startup.
+//
+// A DISPLAY IS NOT ENOUGH. This used to be gated on DISPLAY_CLASS alone, which
+// reasons about output and says nothing about whether the user can type. The
+// console's only input paths are the T-Deck keyboard, the M9 keyboard and the
+// on-screen keypad (CAP_TOUCH), so on any other board it booted, painted
+// "type 'ui' to go back", and accepted nothing: an unbootable-out state that
+// survived a power cycle and a reset, because the pref persists and the panic
+// self-heal never fires when nothing has actually crashed. A ThinkNode M9 was
+// stranded exactly this way on beta_70 (gadgeteerza).
+//
+// Any board added here must have a drain in the console branch of UITask::loop.
+#if defined(HAS_TDECK_KEYBOARD) || defined(HAS_M9_KEYBOARD) || CAP_TOUCH
+  #define CAP_CONSOLE_INPUT 1
+#else
+  #define CAP_CONSOLE_INPUT 0
+#endif
+#ifndef CAP_CONSOLE
+  #if defined(DISPLAY_CLASS) && CAP_CONSOLE_INPUT
+    #define CAP_CONSOLE 1
+  #else
+    #define CAP_CONSOLE 0
+  #endif
+#endif
+
 #if defined(HAS_EXPANSION_KIT)
   #define CAP_SENSORS 1
 #else
   #define CAP_SENSORS 0
+#endif
+
+// Magnetometer readable by apps (wada.sys.compass(), caps().compass). A HARDWARE
+// gate, deliberately separate from CAP_SENSORS (the V4 expansion-kit env
+// sensors) and from the CAP_LUA_SDK_EXT memory gate: the ThinkNode M9's
+// QMC6309 is the only one wired so far (variants/thinknode_m9/M9Compass.*).
+#if defined(HAS_M9_COMPASS)
+  #define CAP_COMPASS 1
+#else
+  #define CAP_COMPASS 0
+#endif
+
+// Accelerometer readable by apps (wada.sys.accel(), caps().accel). Same kind of
+// hardware gate as CAP_COMPASS: the ThinkNode M9's QMI8658 is the only one
+// driven so far (variants/thinknode_m9/M9Imu.*). Its point is tilt — a 2-axis
+// magnetic heading is wrong by ~1.5 degrees per degree of tilt at mid latitudes.
+#if defined(HAS_M9_IMU)
+  #define CAP_IMU 1
+#else
+  #define CAP_IMU 0
 #endif
 
 #if defined(HAS_CC_BRIGHTNESS)
@@ -147,7 +353,18 @@
   #define CAP_KBD_BACKLIGHT 0
 #endif
 
-#if defined(HAS_UI_SOUND)
+// Notification-chime hardware: T-Deck I2S speaker, Pager codec, Heltec V4 / M9 GPIO
+// piezo, T-Display P4 ES8311. Kept in step with the HAS_UI_SOUND definition in
+// UITask.cpp, which now derives FROM this rather than duplicating the list.
+//
+// This used to read `#if defined(HAS_UI_SOUND)`, but HAS_UI_SOUND is defined inside
+// UITask.cpp roughly 1400 lines AFTER this header is included -- so CAP_SOUND was
+// evaluated before it existed and came out 0 on every board, every time. Nothing
+// consumed it, so it was silent rather than broken, but any future `#if CAP_SOUND`
+// would have compiled sound out everywhere. Every macro tested here is a -D on the
+// compiler command line, so they are all genuinely visible at this point.
+#if defined(HAS_TDECK_GT911) || defined(HELTEC_V4_BUZZER_PIN) || defined(TLORA_PAGER) || \
+    defined(THINKNODE_M9_BUZZER_PIN) || defined(HAS_TDISPLAY_P4)
   #define CAP_SOUND 1
 #else
   #define CAP_SOUND 0
@@ -157,6 +374,26 @@
   #define CAP_COMPANION 1
 #else
   #define CAP_COMPANION 0
+#endif
+
+// Per-event WAV notification sounds + the file-browsing sound picker. This is
+// deliberately NOT the same thing as CAP_SD/CAP_FILESYSTEM: it only means
+// "can browse and play WAV files for notifications." Both the T-Deck and the
+// Pager provide that audio path; other boards may expose a filesystem without
+// having compatible notification-sound hardware.
+#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER)
+  #define CAP_SOUND_FILES 1
+#else
+  #define CAP_SOUND_FILES 0
+#endif
+
+// Sustained PCM output for media playback. This is deliberately independent
+// of storage: Lua app files may live on internal flash, SD, or SD_MMC.
+#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || \
+    defined(HAS_TDISPLAY_P4) || defined(HAS_TANMATSU)
+  #define CAP_AUDIO_STREAM 1
+#else
+  #define CAP_AUDIO_STREAM 0
 #endif
 
 // ---- On-device web browser (the "Web" reader app) ---------------------------
@@ -169,4 +406,106 @@
   #define CAP_WEB_BROWSER 0   // 2 MB V4: TLS handshake can't fit
 #else
   #define CAP_WEB_BROWSER 1   // 8 MB boards incl. the V4-R8
+#endif
+
+// ---- Lua app host (LUA_APPS.md) --------------------------------------------
+// Sandboxed Lua 5.4 apps from the store catalog. Board-agnostic by design: the
+// VM costs +96 KB flash and allocates exclusively from PSRAM (256 KB/app cap),
+// so every touch board carries it. Opt out per-board above (define it 0 in the
+// board's block) only if a flash ceiling ever demands it.
+#ifndef CAP_LUA_APPS
+  #define CAP_LUA_APPS 1
+#endif
+
+#ifndef CAP_LUA_AUDIO
+  #if CAP_LUA_APPS && CAP_AUDIO_STREAM
+    #define CAP_LUA_AUDIO 1
+  #else
+    #define CAP_LUA_AUDIO 0
+  #endif
+#endif
+
+// ---- Extended Lua SDK ------------------------------------------------------
+// The BASE SDK (drawing, timers, key/value store, read-only mesh + radio stats,
+// http_get) is board-agnostic and ships everywhere CAP_LUA_APPS is on.
+//
+// The EXTENDED SDK is the part with real running cost, and it is gated:
+//   wada.sys.battery/gps/sensors   live device state
+//   wada.fs.*                      scoped file read/write/list under /apps
+//   wada.net.http_post + wifi_scan
+//   wada.mesh.send + on_message    the only WRITE path into the mesh
+//   wada.ui.input/list + on_key    text entry, lists, key events
+//
+// Why it is not everywhere: these add per-app RAM (an inbound message queue, a
+// scan buffer, retained Lua callbacks) and invite apps that hold buffers and do
+// I/O. The 2 MB-PSRAM Heltec V4 already runs at ~95% internal RAM with Wi-Fi up
+// — the same headroom problem that gates CAP_WEB_BROWSER and forces
+// CAP_BUILTIN_LANGS there — so it gets the base SDK only.
+//
+// TO GATE A FUTURE LOW-RESOURCE BOARD, pick either:
+//   * define WADA_LOW_RESOURCE_BOARD in the board's block  (also gates future extras), or
+//   * define CAP_LUA_SDK_EXT 0 in the board's block        (gates only this)
+// Apps must feature-detect with wada.sys.caps().sdk_ext rather than assume.
+#ifndef CAP_LUA_SDK_EXT
+  #if !CAP_LUA_APPS || defined(WADA_LOW_RESOURCE_BOARD) || \
+      (defined(HELTEC_LORA_V4_TFT) && !defined(HELTEC_LORA_V4_R8))
+    #define CAP_LUA_SDK_EXT 0   // 2 MB V4 (and anything marked low-resource)
+  #else
+    #define CAP_LUA_SDK_EXT 1   // 8 MB boards incl. the V4-R8
+  #endif
+#endif
+
+// ---- USB Files ---------------------------------------------------------------
+// files.wadamesh.com browses and edits the SD card and internal storage over the
+// USB cable (Web Serial) while the USB Files app is open (UsbFilesSession.h).
+// Prototype boards first: the T-Deck (HW-CDC) and the Heltec V4 TFT (TinyUSB
+// CDC), one of each USB serial driver. Others follow once tested on hardware.
+#ifndef CAP_USB_FILES
+  #if (defined(HAS_TDECK_GT911) && !defined(HAS_TDECK_PRO)) || \
+      (defined(HELTEC_LORA_V4_TFT) && !defined(HELTEC_LORA_V4_R8))
+    #define CAP_USB_FILES 1
+  #else
+    #define CAP_USB_FILES 0
+  #endif
+#endif
+
+// Read-only access to a physical SD card's directory tree from Lua. This first
+// pass follows the existing shared-SPI Arduino SD lifecycle; P4 SD_MMC needs its
+// own removal/recovery contract before it can safely expose the same API.
+#ifndef CAP_LUA_SD_LIST
+  #if CAP_LUA_SDK_EXT && CAP_SD
+    #define CAP_LUA_SD_LIST 1
+  #else
+    #define CAP_LUA_SD_LIST 0
+  #endif
+#endif
+
+// Compile the translations into the image (i18n_builtin.h, generated from
+// deploy/apps/lang/*.lang) instead of relying on downloading a .lang file.
+// ON for boards where the Lua Store is not dependable — the V4 runs at ~95%
+// internal RAM with Wi-Fi up, so its net worker and the store are fragile and
+// it would otherwise be stuck on English. Costs ~400 KB of FLASH, no RAM.
+// NOT the V4-R8, although its build defines HELTEC_LORA_V4_TFT to reuse the UI:
+// it has 8 MB of PSRAM, so its net worker and the store work as well as on any
+// other 8 MB board and it downloads its language like they do. Carrying the
+// table anyway put its image over the app partition once the text-size presets
+// added the larger fonts (101.3% of 3.875 MB).
+#ifndef CAP_BUILTIN_LANGS
+  #if !defined(HELTEC_LORA_V4_R8) && (defined(HELTEC_LORA_V4_TFT) || defined(HELTEC_LORA_V4))
+    #define CAP_BUILTIN_LANGS 1
+  #else
+    #define CAP_BUILTIN_LANGS 0
+  #endif
+#endif
+
+// Ship the catalog's Lua apps inside the image (lua_builtin.h, generated from
+// out/firmware/apps/) so a board that cannot reach the Lua Store still has
+// them in the drawer. A downloaded <data>/apps/<id>.lua always wins, because
+// luaAppLaunchFile() is file-first. Costs ~10 KB of FLASH, no RAM.
+#ifndef CAP_BUILTIN_LUA_APPS
+  #if defined(HELTEC_LORA_V4_TFT) || defined(HELTEC_LORA_V4)
+    #define CAP_BUILTIN_LUA_APPS 1
+  #else
+    #define CAP_BUILTIN_LUA_APPS 0
+  #endif
 #endif

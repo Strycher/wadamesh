@@ -24,6 +24,8 @@ enum class KeyboardLayoutId : uint8_t {
     DE = 9,   // German (QWERTZ)
     ES = 10,  // Spanish (QWERTY + accent popups)
     IT = 11,  // Italian (QWERTY + accent popups)
+    RO = 12,  // Romanian (QWERTY, ă/ş/ţ on the deck; â/î via accent popups)
+    LV = 13,  // Latvian (QWERTY, č/š/ž on the deck; ā/ē/ģ/ī/ķ/ļ/ņ/ū via digit row + accent popups)
     Count
 };
 

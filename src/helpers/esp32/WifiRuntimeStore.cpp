@@ -5,6 +5,11 @@
 #include "SdNvsPrefs.h"   // NVS, or SD /meshcomod fallback when NVS is unusable (Launcher)
 #include <WiFi.h>
 #include <cstring>
+#if defined(HAS_TDISPLAY_P4)
+  // T-Display P4: rebind WiFi.* to the c6_at AT-over-SDIO facade — Arduino's real WiFi.mode()/begin()
+  // re-init esp_hosted (the C6 runs ESP-AT, not an esp-hosted slave) and panic the P4. P4-only header.
+  #include <C6WifiShim.h>
+#endif
 
 static const char *WIFI_CONFIG_NAMESPACE = "meshcomod";
 static const char *WIFI_CONFIG_SSID_KEY = "wifi_ssid";
@@ -16,6 +21,9 @@ static const char *WIFI_CONFIG_BLE_EN_KEY = "ble_en";   // BLE radio on/off (def
 static SdNvsPrefs s_prefs;
 static bool s_begun = false;
 static volatile bool s_wifi_apply_requested = false;
+#if defined(TLORA_PAGER)
+static volatile PagerWifiBlePhase s_pager_wifi_ble_phase = PagerWifiBlePhase::Idle;
+#endif
 
 void wifiConfigBegin() {
   if (s_begun) return;
@@ -96,7 +104,14 @@ void wifiConfigClear() {
 
 bool wifiConfigGetRadioEnabled() {
   if (!s_begun) wifiConfigBegin();
+#if defined(HAS_TDECK_MAX)
+  // T-Deck Max: Wi-Fi OFF until the user turns it on. Wi-Fi and BLE together
+  // at boot left ~28% of internal RAM free on this board; BLE (default on) is
+  // the companion transport. The Settings toggle persists whatever is chosen.
+  return s_prefs.getUChar(WIFI_CONFIG_RADIO_EN_KEY, 0) != 0;
+#else
   return s_prefs.getUChar(WIFI_CONFIG_RADIO_EN_KEY, 1) != 0;
+#endif
 }
 
 void wifiConfigSetRadioEnabled(bool enabled) {
@@ -134,6 +149,24 @@ void wifiConfigSetBleEnabled(bool enabled) {
   s_prefs.end();
   s_begun = s_prefs.begin(WIFI_CONFIG_NAMESPACE, true);
 }
+
+#if defined(TLORA_PAGER)
+void wifiConfigSetPagerWifiBlePhase(PagerWifiBlePhase phase) {
+  s_pager_wifi_ble_phase = phase;
+}
+
+PagerWifiBlePhase wifiConfigGetPagerWifiBlePhase() {
+  return s_pager_wifi_ble_phase;
+}
+
+bool wifiConfigPagerWifiBlocksBle() {
+  return s_pager_wifi_ble_phase == PagerWifiBlePhase::Associating;
+}
+
+bool wifiConfigPagerBleFallbackActive() {
+  return s_pager_wifi_ble_phase == PagerWifiBlePhase::BleFallback;
+}
+#endif
 
 bool wifiConfigGetWifiChosen() {
   if (!s_begun) wifiConfigBegin();
@@ -181,6 +214,13 @@ void wifiScanSetActive(bool active) { s_wifi_scan_active = active; }
 bool wifiScanIsActive() { return s_wifi_scan_active; }
 
 void wifiConfigApply() {
+#if defined(MULTI_TRANSPORT_COMPANION) && !defined(HAS_TANMATSU)
+  // Multi-transport targets serialize apply and worker scans in main.cpp. The
+  // Pager additionally releases/recreates NimBLE around WPA. Calling
+  // disconnect()/begin() directly here bypasses both ownership contracts.
+  wifiConfigRequestApply();
+  return;
+#endif
 #if defined(HAS_TANMATSU)
   printf("[WIFI] apply radio_en=%d hasRuntime=%d mode=%d status=%d\n",
          (int)wifiConfigGetRadioEnabled(), (int)wifiConfigHasRuntime(),

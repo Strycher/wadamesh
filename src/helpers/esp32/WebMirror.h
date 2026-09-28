@@ -78,6 +78,14 @@ public:
   void requestExit() { _exit_req = true; }
   bool takeExit() { bool v = _exit_req; _exit_req = false; return v; }
 
+  // ---- screen lock (#506): a browser can't hold the trackball or press BOOT, so the
+  //      page shows an Unlock button while the device is manually locked (device ->
+  //      browser) and sends the unlock request back (browser -> device). ----
+  void setLocked(bool l) { _locked = l; }
+  bool locked() const { return _locked; }
+  void requestUnlock() { _unlock_req = true; }
+  bool takeUnlock() { bool v = _unlock_req; _unlock_req = false; return v; }
+
   // ============ web mesh terminal (text CLI over WS; separate from the framebuffer) ============
   // Lightweight text path: browser sends a command line, the device runs runLocalCli() and
   // streams the CLI reply text back. No framebuffer, no reboot. Runtime toggle; the WS server
@@ -116,13 +124,23 @@ private:
   volatile uint8_t _ppressed = 0;
   volatile uint8_t _pknown   = 0;
 
-  static const int KEY_RING = 32;   // typed keys awaiting the UI thread (SPSC)
+  // Typed keys awaiting the UI thread (SPSC). 32 was far too small: the browser pushes from
+  // the network thread while the UI drains only a handful per loop iteration, and one
+  // iteration can be tens of ms (LVGL frame, SD write, radio). Anything arriving FASTER than
+  // that drain overflowed, and pushKey discards the overflow SILENTLY -- which is exactly
+  // what a phone autocomplete or a paste looks like, because it delivers a whole word at
+  // once. Reported over the web mirror as "missing a lot of characters while typing".
+  // 256 entries costs 512 bytes and is the MAXIMUM this ring can hold while _khead/_ktail
+  // stay uint8_t; anything larger REQUIRES widening those two or the modulo silently wraps.
+  static const int KEY_RING = 256;
   uint16_t _keys[KEY_RING];
   volatile uint8_t _khead = 0, _ktail = 0;
   volatile bool _kb_focused = false, _kb_dirty = false;   // editable-field focus signal
   volatile bool _remote = false;          // remote mode -> browser shows the Rotate button
   volatile uint8_t _orient_req = 0;       // browser-requested orientation (1=landscape, 2=portrait, 0=none)
   volatile bool _exit_req = false;        // browser asked to leave remote mode
+  volatile bool _locked = false;          // device screen is manually locked
+  volatile bool _unlock_req = false;      // browser asked to unlock the screen
 
   // ---- web terminal channels ----
   volatile bool _term_on = false;

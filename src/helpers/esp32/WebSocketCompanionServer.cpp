@@ -5,6 +5,10 @@
 #include <lwip/sockets.h>
 #include <esp_heap_caps.h>
 #include "WebMirror.h"
+#if WADA_WEB_FILE_TRANSFER
+#include "WebFileTransfer.h"
+#include "WebFileTransferPage.h"
+#endif
 
 #ifndef WS_FRAME_DEBUG
 #define WS_FRAME_DEBUG 0
@@ -26,6 +30,7 @@
 static const char WS_HTTP_INFO_PAGE[] =
   "HTTP/1.1 200 OK\r\n"
   "Content-Type: text/html; charset=utf-8\r\n"
+  "Cache-Control: no-store\r\n"
   "Connection: close\r\n"
   "\r\n"
   "<!DOCTYPE html><html><head><meta charset=utf-8>\n"
@@ -36,14 +41,18 @@ static const char WS_HTTP_INFO_PAGE[] =
   "html,body{margin:0;height:100%;background:#0b0b0c;color:#e8e8ea;font-family:system-ui,-apple-system,sans-serif;overflow:hidden;-webkit-user-select:none;user-select:none;touch-action:none}\n"
   "#w{display:flex;flex-direction:column;align-items:center;justify-content:flex-start;height:100%;gap:8px;padding-top:6px;box-sizing:border-box}\n"
   "#c{background:#000;image-rendering:auto;max-width:100vw;box-shadow:0 0 26px #000a;border-radius:8px}\n"
-  "#s{font-size:13px;opacity:.7} #s.ok{color:#19d6c2} #s.err{color:#ff6b6b}\n"
+  "#s{font-size:13px;opacity:.7;max-width:calc(100vw - 16px);text-align:center} #s.ok{color:#19d6c2} #s.err{color:#ff6b6b}\n"
   "b{color:#19d6c2;letter-spacing:.5px}\n"
-  "#kb{margin-top:8px;padding:9px 18px;font-size:14px;background:#1c1c1f;color:#e8e8ea;border:1px solid #333;border-radius:8px}\n"
+  "#ctl{display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;max-width:calc(100vw - 8px)}\n"
+  "#ctl button{margin:0;min-height:34px}\n"
+  "#kb{padding:8px 16px;font-size:14px;background:#1c1c1f;color:#e8e8ea;border:1px solid #333;border-radius:8px}\n"
   "#kb:active{background:#19d6c2;color:#000;border-color:#19d6c2}\n"
-  "#rot{margin-top:6px;padding:7px 15px;font-size:12px;background:#141416;color:#c8ccce;border:1px solid #2a2a2e;border-radius:8px;display:none}\n"
+  "#rot{padding:7px 15px;font-size:12px;background:#141416;color:#c8ccce;border:1px solid #2a2a2e;border-radius:8px;display:none}\n"
   "#rot:active{background:#19d6c2;color:#000;border-color:#19d6c2}\n"
-  "#xit{margin-top:6px;padding:7px 15px;font-size:12px;background:#1e1416;color:#e0a6a6;border:1px solid #4a2a2e;border-radius:8px;display:none}\n"
+  "#xit{padding:7px 15px;font-size:12px;background:#1e1416;color:#e0a6a6;border:1px solid #4a2a2e;border-radius:8px;display:none}\n"
   "#xit:active{background:#ff6b6b;color:#000;border-color:#ff6b6b}\n"
+  "#unl{padding:8px 16px;font-size:14px;background:#19d6c2;color:#000;border:1px solid #19d6c2;border-radius:8px;font-weight:600;display:none}\n"
+  "#unl:active{background:#0f8f82;border-color:#0f8f82}\n"
   "#k{position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;border:0;padding:0;font-size:16px}\n"
   "#hdr{position:fixed;top:14px;left:18px;display:none;align-items:center;gap:11px;z-index:5}\n"
   "#hdr .wm{font-family:'JetBrains Mono','Courier New',monospace;font-weight:700;font-size:22px;letter-spacing:2px;color:#e8e8ea}\n"
@@ -57,9 +66,10 @@ static const char WS_HTTP_INFO_PAGE[] =
   "<div id=cap><b>wadamesh</b> &nbsp; live UI</div>\n"
   "<canvas id=c width=320 height=240></canvas>\n"
   "<div id=s>connecting...</div>\n"
+  "<div id=ctl><button id=unl>Unlock screen</button>\n"
   "<button id=kb>&#9000; Keyboard</button>\n"
   "<button id=rot>&#8635; Rotate</button>\n"
-  "<button id=xit>&#10005; Exit remote</button>\n"
+  "<button id=xit>&#10005; Exit remote</button></div>\n"
   "<textarea id=k autocomplete=off autocorrect=off autocapitalize=off spellcheck=false></textarea>\n"
   "</div>\n"
   "<script>\n"
@@ -67,18 +77,22 @@ static const char WS_HTTP_INFO_PAGE[] =
   "var OT=document.createElement('canvas'),OX=OT.getContext('2d');\n"
   "var DW=320,DH=240,down=false,last=0,ws;\n"
   "var isTouch=('ontouchstart' in window)||navigator.maxTouchPoints>0,kbT=null;\n"
-  "var ROT=document.getElementById('rot'),XIT=document.getElementById('xit');\n"
+  "var ROT=document.getElementById('rot'),XIT=document.getElementById('xit'),CTL=document.getElementById('ctl');\n"
+  "var UNL=document.getElementById('unl'),LK=false;\n"
   "function st(t,k){S.textContent=t;S.className=k||''}\n"
   "function conn(){\n"
   " ws=new WebSocket((location.protocol=='https:'?'wss://':'ws://')+location.host+'/mirror');\n"
   " ws.binaryType='arraybuffer';\n"
-  " ws.onopen=function(){st('connected','ok')};\n"
+  " ws.onopen=function(){LK=false;UNL.style.display='none';st('connected','ok')};\n"
   " ws.onclose=function(){st('disconnected - retrying','err');setTimeout(conn,1500)};\n"
   " ws.onerror=function(){st('connection error','err')};\n"
   " ws.onmessage=function(e){\n"
   "  var a=new Uint8Array(e.data);\n"
-  "  if(a[0]==2){DW=a[1]|(a[2]<<8);DH=a[3]|(a[4]<<8);if(C.width!=DW)C.width=DW;if(C.height!=DH)C.height=DH;var rem=(a.length>5&&(a[5]&1))?'':'none';ROT.style.display=rem;XIT.style.display=rem;fit();return}\n"
+  "  if(a[0]==2){var nw=a[1]|(a[2]<<8),nh=a[3]|(a[4]<<8),rem=a.length>5&&!!(a[5]&1),valid=nw>0&&nh>0;\n"
+  "   if(valid){DW=nw;DH=nh;if(C.width!=DW)C.width=DW;if(C.height!=DH)C.height=DH}else{st('screen stream unavailable - use Exit remote','err')}\n"
+  "   ROT.style.display=(rem&&valid)?'inline-block':'none';XIT.style.display=(rem||!valid)?'inline-block':'none';fit();return}\n"
   "  if(a[0]==3){clearTimeout(kbT);if(a[1])K.focus();else K.blur();return}\n"
+  "  if(a[0]==6){var l=!!a[1];if(l!=LK){LK=l;UNL.style.display=l?'inline-block':'none';st(l?'screen locked':'connected',l?'':'ok');fit()}return}\n"
   "  if(a[0]==1){\n"
   "   var fl=a[1],x=a[2]|(a[3]<<8),y=a[4]|(a[5]<<8),w=a[6]|(a[7]<<8),h=a[8]|(a[9]<<8);\n"
   "   var hf=fl&2,ow=hf?((w+1)>>1):w,oh=hf?((h+1)>>1):h;\n"
@@ -106,6 +120,7 @@ static const char WS_HTTP_INFO_PAGE[] =
   "var K=document.getElementById('k');\n"
   "document.getElementById('kb').addEventListener('click',function(){K.value=' ';K.focus();try{K.setSelectionRange(1,1)}catch(x){}});\n"
   "ROT.addEventListener('click',function(){if(!ws||ws.readyState!=1)return;st('rotating - reconnecting','');ws.send(new Uint8Array([4,DW<DH?1:0]))});\n"
+  "UNL.addEventListener('click',function(){if(!ws||ws.readyState!=1)return;ws.send(new Uint8Array([6]))});\n"
   "XIT.addEventListener('click',function(){if(!ws||ws.readyState!=1)return;if(!confirm('Leave remote mode? The device reboots to its normal screen.'))return;st('leaving remote - rebooting','');ws.send(new Uint8Array([5]))});\n"
   "function skey(cp){if(!ws||ws.readyState!=1)return;ws.send(new Uint8Array([2,cp&255,(cp>>8)&255]))}\n"
   "K.addEventListener('beforeinput',function(e){var t=e.inputType;\n"
@@ -119,8 +134,9 @@ static const char WS_HTTP_INFO_PAGE[] =
   " else if(e.key=='Enter'){skey(13);e.preventDefault()}\n"
   " else if(e.key.length==1){skey(e.key.codePointAt(0));e.preventDefault()}});\n"
   "function fit(){var vv=window.visualViewport,vw=vv?vv.width:window.innerWidth,vh=vv?vv.height:window.innerHeight;\n"
-  " var desk=matchMedia('(hover:hover) and (pointer:fine)').matches,ch=desk?102:60,f=desk?0.72:0.99;\n"
-  " var aw=vw-8,ah=vh-ch;if(aw<60)aw=60;if(ah<60)ah=60;var s=Math.min(aw/DW,ah/DH)*f;\n"
+  " var desk=matchMedia('(hover:hover) and (pointer:fine)').matches,f=desk?0.72:0.99,cap=document.getElementById('cap');\n"
+  " var ch=6+S.offsetHeight+CTL.offsetHeight+16;if(cap.offsetParent!==null)ch+=cap.offsetHeight+8;\n"
+  " var aw=vw-8,ah=vh-ch-2;if(aw<60)aw=60;if(ah<40)ah=40;var s=Math.min(aw/DW,ah/DH)*f;\n"
   " C.style.width=Math.max(1,Math.round(DW*s))+'px';C.style.height=Math.max(1,Math.round(DH*s))+'px'}\n"
   "if(window.visualViewport)window.visualViewport.addEventListener('resize',fit);\n"
   "window.addEventListener('resize',fit);fit();\n"
@@ -165,10 +181,13 @@ static const char WS_HTML_TERMINAL_PAGE[] =
   ".b.in{align-self:flex-start;background:#17181b}.b.out{align-self:flex-end;background:#123f3a}\n"
   ".bname{font-size:11px;color:#19d6c2;margin-bottom:2px}.btext{white-space:pre-wrap}\n"
   ".bmeta{font-size:10px;color:#8a9095;text-align:right;margin-top:2px}\n"
-  ".cb{display:flex;border-top:1px solid #1c1c1f;padding:8px;gap:8px}\n"
-  ".cb input{flex:1;background:#111214;color:#e8e8ea;border:1px solid #2a2a2e;border-radius:18px;padding:9px 14px;font:inherit;outline:none}\n"
+  ".cb{display:flex;border-top:1px solid #1c1c1f;padding:8px;gap:8px;position:relative}.cwrap{position:relative;flex:1;min-width:0}\n"
+  ".cb input{width:100%;background:#111214;color:#e8e8ea;border:1px solid #2a2a2e;border-radius:18px;padding:9px 14px;font:inherit;outline:none}\n"
   ".cb input:focus{border-color:#19d6c2}\n"
   ".cb button{background:#19d6c2;color:#04201d;border:none;border-radius:18px;padding:0 16px;font-weight:700;cursor:pointer}\n"
+  "#mnames{display:none;position:absolute;left:0;right:0;bottom:calc(100% + 6px);z-index:12;background:#151619;border:1px solid #2a2a2e;border-radius:8px;box-shadow:0 5px 18px rgba(0,0,0,.5);overflow:hidden}\n"
+  "#mnames.on{display:block}#mnames button{display:block;width:100%;border:0;border-bottom:1px solid #202225;border-radius:0;background:#151619;color:#d7dbdd;text-align:left;padding:9px 13px;font:inherit;cursor:pointer}\n"
+  "#mnames button:last-child{border-bottom:0}#mnames button.on{background:#17342f;color:#19d6c2}\n"
   "#o{flex:1;overflow-y:auto;padding:10px 12px;white-space:pre-wrap;word-break:break-word;line-height:1.4;font-family:'JetBrains Mono',Menlo,monospace;font-size:13px}\n"
   "#tbar{display:flex;border-top:1px solid #1c1c1f;padding:8px 10px;gap:8px;align-items:center}\n"
   "#p{color:#19d6c2;font-weight:700}\n"
@@ -215,7 +234,7 @@ static const char WS_HTML_TERMINAL_PAGE[] =
   " <div id=cview style=display:none>\n"
   "  <div id=cvh><button id=cvback>&lsaquo;</button><span id=cvname></span></div>\n"
   "  <div id=cvmsgs></div>\n"
-  "  <div class=cb><input id=cvi placeholder='Message' autocomplete=off><button id=cvsend>Send</button></div>\n"
+  "  <div class=cb><div class=cwrap><input id=cvi maxlength=160 placeholder='Message' autocomplete=off><div id=mnames></div></div><button id=cvsend>Send</button></div>\n"
   " </div>\n"
   "</div>\n"
   "<div id=pcontacts class=pane style=display:none>\n"
@@ -233,6 +252,7 @@ static const char WS_HTML_TERMINAL_PAGE[] =
   "<div id=toast></div>\n"
   "<script>\n"
   "var WS,dec=new TextDecoder(),curTab='chats',chat=null,threads=[],contacts=[],channels=[];\n"
+  "var mentionNames=[],mentionMatches=[],mentionSel=0,mentionReq=0;\n"
   "var csort=0,cfilter=0,csearchq='',self={la:0,lo:0},lpAt=0,useMi=0,discCount=0;\n"
   "var SORTL=['Recent','A-Z','Distance'],FILTL=['All','Repeaters','Peers','Favorites','Located','Direct'];\n"
   "function age(ts){if(!ts||ts<1000000000)return'';var s=Math.floor(Date.now()/1000)-ts;if(s<0)s=0;if(s<60)return'now';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h';if(s<604800)return Math.floor(s/86400)+'d';return Math.floor(s/604800)+'w'}\n"
@@ -245,6 +265,16 @@ static const char WS_HTML_TERMINAL_PAGE[] =
   "function stat(t,k){var el=E('dot');el.style.color=(k=='ok')?'#19d6c2':((k=='err')?'#ff6b6b':'#63696e');el.title=t}\n"
   "function wsSend(s){if(WS&&WS.readyState==1){WS.send(s);return true}return false}\n"
   "function cById(i){for(var k=0;k<contacts.length;k++)if(contacts[k].i==i)return contacts[k];return null}\n"
+  "function mentionHide(){mentionMatches=[];mentionSel=0;var b=E('mnames');b.classList.remove('on');b.innerHTML=''}\n"
+  "function mentionToken(){var i=E('cvi'),v=i.value,p=i.selectionStart;if(p==null)return null;var a=p,found=false,punc=',.;:!?()[]{}<>';\n"
+  " while(a>0){var c=v.charAt(a-1);if(c=='@'){a--;found=true;break}if(' \\n\\t\\r'.indexOf(c)>=0||punc.indexOf(c)>=0)return null;a--}\n"
+  " if(!found||(a>0&&' \\n\\t\\r'.indexOf(v.charAt(a-1))<0))return null;var end=p;while(end<v.length&&' \\n\\t\\r'.indexOf(v.charAt(end))<0&&punc.indexOf(v.charAt(end))<0)end++;return{a:a,p:p,e:end,q:v.slice(a+1,p)}}\n"
+  "function mentionPaint(){var b=E('mnames');b.innerHTML='';if(!mentionMatches.length){mentionHide();return}\n"
+  " mentionMatches.forEach(function(n,idx){var x=document.createElement('button');x.type='button';x.textContent='@'+n;if(idx==mentionSel)x.className='on';x.onmousedown=function(e){e.preventDefault()};x.onclick=function(){mentionPick(n)};b.appendChild(x)});b.classList.add('on')}\n"
+  "function mentionRefresh(){var t=mentionToken();if(!t){mentionHide();return}var q=t.q.toLowerCase();mentionMatches=mentionNames.filter(function(n){return n.toLowerCase().indexOf(q)==0}).slice(0,6);if(mentionSel>=mentionMatches.length)mentionSel=0;mentionPaint()}\n"
+  "function mentionPick(n){var i=E('cvi'),t=mentionToken();if(!t)return mentionHide();var v=i.value,sp=t.e==v.length?' ':'';i.value=v.slice(0,t.a)+'@'+n+sp+v.slice(t.e);var p=t.a+1+n.length+sp.length;mentionHide();i.focus();i.setSelectionRange(p,p)}\n"
+  "function mentionMove(d){if(!mentionMatches.length)return;mentionSel=(mentionSel+d+mentionMatches.length)%mentionMatches.length;mentionPaint()}\n"
+  "function mentionRequest(){if(!chat)return;mentionReq++;wsSend('@mh '+mentionReq)}\n"
   "function showTab(t){curTab=t;['chats','contacts','term'].forEach(function(x){E('p'+x).style.display=(x==t)?'':'none'});\n"
   " each(document.querySelectorAll('#tabs button'),function(b){b.className=(b.getAttribute('data-t')==t)?'on':''});\n"
   " if(t=='chats'){if(!chat){closeChat();wsSend('@t')}}else if(t=='contacts'){wsSend('@c')}else if(t=='term'){E('i').focus()}}\n"
@@ -306,24 +336,25 @@ static const char WS_HTML_TERMINAL_PAGE[] =
   "var QCMDS=[{h:'CHAT'},{l:'list - contacts',c:'list'},{l:'channels',c:'channels'},{l:'to <name>',c:'to '},{l:'send <text>',c:'send '},{l:'public <text>',c:'public '},{l:'exit',c:'exit'},\n"
   " {h:'INFO'},{l:'help',c:'help'},{l:'ver - firmware version',c:'ver'},{l:'clock - RTC time',c:'clock'},{l:'status',c:'status'},{l:'get - radio params',c:'get'},\n"
   " {h:'RADIO / MESH'},{l:'advert',c:'advert'},{l:'advert.zerohop',c:'advert.zerohop'},{l:'set name <v>',c:'set name '},{l:'set freq <MHz>',c:'set freq '},{l:'set bw <kHz>',c:'set bw '},{l:'set sf <7-12>',c:'set sf '},{l:'set cr <5-8>',c:'set cr '},{l:'set tx <dBm>',c:'set tx '},\n"
-  " {h:'CONNECTIVITY'},{l:'wifi status',c:'wifi status'},{l:'wifi on',c:'wifi on'},{l:'wifi off',c:'wifi off'},{l:'wifi scan',c:'wifi scan'},{l:'wifi apply',c:'wifi apply'},{l:'wifi clear',c:'wifi clear'},{l:'tcp status',c:'tcp status'},{l:'tcp on',c:'tcp on'},{l:'tcp off',c:'tcp off'},{l:'ble status',c:'ble status'},{l:'ble on',c:'ble on'},{l:'ble off',c:'ble off'},{l:'ota status',c:'ota status'},{l:'ota start',c:'ota start'},\n"
+  " {h:'CONNECTIVITY'},{l:'wifi status',c:'wifi status'},{l:'wifi on',c:'wifi on'},{l:'wifi off',c:'wifi off'},{l:'wifi scan',c:'wifi scan'},{l:'wifi apply',c:'wifi apply'},{l:'wifi clear',c:'wifi clear'},{l:'mqtt status',c:'mqtt status'},{l:'tcp status',c:'tcp status'},{l:'tcp on',c:'tcp on'},{l:'tcp off',c:'tcp off'},{l:'ble status',c:'ble status'},{l:'ble on',c:'ble on'},{l:'ble off',c:'ble off'},{l:'ota status',c:'ota status'},{l:'ota start',c:'ota start'},\n"
   " {h:'SYSTEM'},{l:'reboot',c:'reboot'},{l:'bootloader - download mode',c:'bootloader'}];\n"
   "function cmdPicker(){var h='<h4>Commands</h4>';QCMDS.forEach(function(x,i){if(x.h)h+='<div class=sec>'+esc(x.h)+'</div>';else h+='<button class=si data-i='+i+'>'+esc(x.l)+'</button>'});\n"
   " E('sheet').innerHTML=h;each(E('sheet').querySelectorAll('.si'),function(b){b.onclick=function(){var x=QCMDS[+b.getAttribute('data-i')];closeOv();showTab('term');E('i').value=x.c;E('i').focus()}});\n"
   " E('sheet').classList.add('on');E('scrim').classList.add('on')}\n"
-  "var hist=[],hi=0,CMDS=['help','?','status','ver','clock','get','advert','advert.zerohop','reboot','bootloader','set ','tcp ','ble ','ota ','wifi ','list','contacts','channels','to ','send ','public ','exit','leave','ok','cancel','clear'];\n"
+  "var hist=[],hi=0,CMDS=['help','?','status','ver','clock','get','advert','advert.zerohop','reboot','bootloader','set ','mqtt ','tcp ','ble ','ota ','wifi ','list','contacts','channels','to ','send ','public ','exit','leave','ok','cancel','clear'];\n"
   "function tadd(t,cls){var s=document.createElement('span');if(cls)s.className=cls;s.textContent=t;E('o').appendChild(s);E('o').scrollTop=E('o').scrollHeight}\n"
   "function tsend(){var v=E('i').value;E('i').value='';if(!v.trim())return;if(v.trim()=='clear'){E('o').innerHTML='';return}\n"
   " tadd('\\n> '+v+'\\n','c');hist.push(v);hi=hist.length;if(!wsSend(v))tadd('(not connected)\\n','err')}\n"
   "function onData(s){var d;try{d=JSON.parse(s)}catch(_){return}\n"
   " if(d.t=='t'){onThreads(d.threads||[])}\n"
   " else if(d.t=='c'){contacts=d.contacts||[];channels=d.channels||[];discCount=d.dc||0;renderContacts()}\n"
+  " else if(d.t=='mh'){if(+d.q==mentionReq){mentionNames=d.names||[];mentionRefresh()}}\n"
   " else if(d.t=='m'){openChatView(d)}\n"
   " else if(d.t=='st'){renderStatus(d)}\n"
   " else if(d.t=='ci'){showContactInfo(d)}\n"
   " else if(d.t=='dc'){showDiscovered(d.nodes||[])}\n"
   " else if(d.t=='sg'){showSettings(d)}\n"
-  " else if(d.t=='rx'){wsSend('@t');if(chat&&chat.i>=0)wsSend('@m '+chat.i);if(curTab=='contacts')wsSend('@c')}}\n"
+  " else if(d.t=='rx'){wsSend('@t');if(chat&&chat.i>=0)wsSend('@m '+chat.i);if(chat)mentionRequest();if(curTab=='contacts')wsSend('@c')}}\n"
   "function renderThreads(){var h='';if(!threads.length)h='<div class=empty>No chats yet.<br>Start one from Contacts.</div>';\n"
   " threads.sort(function(a,b){return (b.ts||0)-(a.ts||0)});\n"
   " threads.forEach(function(t){var bd=t.u>0?'<span class=badge>'+t.u+'</span>':'';\n"
@@ -353,7 +384,7 @@ static const char WS_HTML_TERMINAL_PAGE[] =
   "function showSettings(d){var g=E;\n"
   " var h='<div class=sset><label>NODE NAME</label><div class=srow><input type=text id=sfname><button class=sbtn id=sbname>Save</button></div>';\n"
   " h+='<label>RADIO (applies live)</label><div class=sgrid>';\n"
-  " h+='<div class=f><label>Freq MHz</label><input type=number step=0.001 id=sffreq></div><div class=f><label>BW kHz</label><input type=number id=sfbw></div>';\n"
+  " h+='<div class=f><label>Freq MHz</label><input type=number step=0.001 id=sffreq></div><div class=f><label>BW kHz</label><input type=number step=0.1 id=sfbw></div>';\n"
   " h+='<div class=f><label>SF</label><input type=number id=sfsf></div><div class=f><label>CR</label><input type=number id=sfcr></div>';\n"
   " h+='<div class=f><label>TX dBm</label><input type=number id=sftx></div><div class=f><label>&nbsp;</label><button class=sbtn id=sbradio style=width:100%>Apply</button></div></div>';\n"
   " h+='<label>CONNECTIVITY</label><div class=stog><b>Wi-Fi</b><div class=sw id=swifi><i></i></div></div>';\n"
@@ -380,12 +411,12 @@ static const char WS_HTML_TERMINAL_PAGE[] =
   "  var nm=(!m.o&&chat.ch)?'<div class=bname>'+esc(m.s)+'</div>':'';\n"
   "  h+='<div class=\"'+cls+'\" data-mi='+i+'>'+nm+'<div class=btext>'+esc(m.x)+'</div><div class=bmeta>'+meta+'</div></div>'});\n"
   " E('cvmsgs').innerHTML=h;if(!same||wasBottom)E('cvmsgs').scrollTop=E('cvmsgs').scrollHeight;\n"
-  " each(E('cvmsgs').querySelectorAll('.b'),function(b){var m=arr[+b.getAttribute('data-mi')];longPress(b,function(){if(m)msgSheet(m)})})}\n"
-  "function closeChat(){chat=null;E('cview').style.display='none';E('tlist').style.display=''}\n"
-  "function chatSend(){var v=E('cvi').value.trim();if(!v||!chat)return;E('cvi').value='';\n"
+  " each(E('cvmsgs').querySelectorAll('.b'),function(b){var m=arr[+b.getAttribute('data-mi')];longPress(b,function(){if(m)msgSheet(m)})});if(!same)mentionRequest()}\n"
+  "function closeChat(){mentionHide();chat=null;E('cview').style.display='none';E('tlist').style.display=''}\n"
+  "function chatSend(){mentionHide();var v=E('cvi').value.trim();if(!v||!chat)return;E('cvi').value='';\n"
   " if(chat.i>=0)wsSend('@s '+chat.i+' '+v);else if(chat.c!=null)wsSend('@sc '+chat.c+' '+v);else if(chat.h!=null)wsSend('@sh '+chat.h+' '+v)}\n"
   "function conn(){WS=new WebSocket((location.protocol=='https:'?'wss://':'ws://')+location.host+'/term');WS.binaryType='arraybuffer';\n"
-  " WS.onopen=function(){stat('online','ok');wsSend('@st');if(curTab=='chats')wsSend('@t')};\n"
+  " WS.onopen=function(){stat('online','ok');wsSend('@st');if(curTab=='chats')wsSend('@t');if(chat)mentionRequest()};\n"
   " WS.onclose=function(){stat('reconnecting...','err');setTimeout(conn,1500)};WS.onerror=function(){stat('error','err')};\n"
   " WS.onmessage=function(e){var b=new Uint8Array(e.data);if(!b.length)return;var ty=b[0],p=dec.decode(b.subarray(1));if(ty==0)tadd(p);else if(ty==1)onData(p)}}\n"
   "each(document.querySelectorAll('#tabs button'),function(b){b.onclick=function(){showTab(b.getAttribute('data-t'))}});\n"
@@ -394,7 +425,9 @@ static const char WS_HTML_TERMINAL_PAGE[] =
   "E('cfilt').onclick=function(){sheet('Filter',FILTL.map(function(f,i){return {label:(i==cfilter?'\\u2713 ':'')+f,fn:function(){cfilter=i;renderContacts()}}}))};\n"
   "E('csearch').addEventListener('input',function(){csearchq=E('csearch').value.trim().toLowerCase();renderContacts()});\n"
   "E('cvback').onclick=function(){closeChat();wsSend('@t')};E('cvsend').onclick=chatSend;\n"
-  "E('cvi').addEventListener('keydown',function(e){if(e.key=='Enter'){chatSend();e.preventDefault()}});\n"
+  "E('cvi').addEventListener('input',mentionRefresh);E('cvi').addEventListener('click',mentionRefresh);\n"
+  "E('cvi').addEventListener('blur',function(){setTimeout(mentionHide,120)});\n"
+  "E('cvi').addEventListener('keydown',function(e){if(mentionMatches.length){if(e.key=='ArrowDown'){mentionMove(1);e.preventDefault();return}if(e.key=='ArrowUp'){mentionMove(-1);e.preventDefault();return}if(e.key=='Enter'||e.key=='Tab'){mentionPick(mentionMatches[mentionSel]);e.preventDefault();return}if(e.key=='Escape'){mentionHide();e.preventDefault();return}}if(e.key=='Enter'){chatSend();e.preventDefault()}});\n"
   "E('i').addEventListener('keydown',function(e){if(e.key=='Enter'){tsend();e.preventDefault()}\n"
   " else if(e.key=='ArrowUp'){if(hi>0){hi--;E('i').value=hist[hi];e.preventDefault()}}\n"
   " else if(e.key=='ArrowDown'){if(hi<hist.length-1){hi++;E('i').value=hist[hi]}else{hi=hist.length;E('i').value=''}e.preventDefault()}\n"
@@ -435,6 +468,12 @@ static void base64Encode20(const uint8_t* in, char* out) {
 // in TCPCompanionServer.cpp. Without it, WiFiClient::write() against a peer that
 // stopped ACKing (half-open socket) blocks in 1 s select() waits on the loop thread.
 static bool socketWritableNow(WiFiClient& client) {
+#if defined(HAS_TDISPLAY_P4)
+  // C6/AT transport: no lwIP fd to select() on (fd() is -1 by design). Writes go through the AT
+  // worker whose CIPSEND exchange is itself bounded (the C6 buffers TX), so liveness is the only
+  // cheap pre-check here.
+  return client.connected();
+#else
   int fd = client.fd();
   if (fd < 0) return false;
   fd_set wset;
@@ -444,6 +483,7 @@ static bool socketWritableNow(WiFiClient& client) {
   tv.tv_sec = 0;
   tv.tv_usec = 0;
   return select(fd + 1, NULL, &wset, NULL, &tv) > 0 && FD_ISSET(fd, &wset);
+#endif
 }
 
 static bool writeAllBytes(WiFiClient& client, const uint8_t* buf, size_t len, uint32_t timeout_ms) {
@@ -490,7 +530,18 @@ WebSocketCompanionServer::WebSocketCompanionServer()
     _clients[i].stall_ms = 0;
     _clients[i].is_mirror = false;
     _clients[i].is_term = false;
+    _clients[i].is_files = false;
     _clients[i].meta_sent = false;
+    _clients[i].lock_sent = 0xFF;
+  #if WADA_WEB_FILE_TRANSFER
+    _clients[i].files_authed = false;
+    _clients[i].files_close_after_tx = false;
+    _clients[i].files_request_pending = false;
+    _clients[i].files_frame_started_ms = 0;
+    _clients[i].files_auth_failures = 0;
+    _clients[i].files_rx_buf = nullptr;
+    _clients[i].files_rx_len = 0;
+  #endif
     _clients[i].tx_buf = nullptr;
     _clients[i].tx_len = 0;
     _clients[i].tx_sent = 0;
@@ -529,48 +580,73 @@ void WebSocketCompanionServer::resumeListen() {
   Serial.printf("[WS] listen resumed port=%u (plain)\n", (unsigned)_port);
 }
 
+void WebSocketCompanionServer::adoptClient(WiFiClient& incoming) {
+  // Slot-insert an already-accepted connection. Used by our own accept loop below AND by the
+  // T-Display P4's first-byte router (one shared AT listener dispatches companion vs web).
+  WsClientsLock _lk(_client_mtx);
+  int slot = -1;
+  for (int i = 0; i < WS_COMPANION_MAX_CLIENTS; i++) {
+    if (!_clients[i].in_use) {
+      slot = i;
+      break;
+    }
+  }
+  // No free slot: evict the oldest existing client so a fresh connect can
+  // recover from stuck slots (half-closed sockets where connected() still
+  // reports true). Without this, every new connect is accept()ed then
+  // immediately stop()ed, producing SYN/SYN+ACK/ACK/FIN-ACK with zero data.
+  if (slot < 0) {
+#if WADA_WEB_FILE_TRANSFER
+    // The third slot is reserved capacity for the runtime file-transfer client.
+    // Never let a new browser connection evict a live companion/VNC/terminal
+    // client before its HTTP path is known; a full server simply refuses it.
+    incoming.stop();
+    return;
+#else
+    uint32_t now = millis();
+    uint32_t oldest_age = 0;
+    for (int i = 0; i < WS_COMPANION_MAX_CLIENTS; i++) {
+      uint32_t age = now - _clients[i].accept_ms;
+      if (slot < 0 || age > oldest_age) {
+        slot = i;
+        oldest_age = age;
+      }
+    }
+    _clients[slot].client.stop();
+    _clients[slot].in_use = false;
+  #endif
+  }
+  _clients[slot].client = incoming;
+  _clients[slot].in_use = true;
+  _clients[slot].accept_ms = millis();
+  _clients[slot].handshake_done = false;
+  _clients[slot].handshake_len = 0;
+  _clients[slot].ws_state = WS_STATE_HEADER_0;
+  _clients[slot].comp_state = COMP_STATE_IDLE;
+  _clients[slot].stall_ms = 0;
+  _clients[slot].is_mirror = false;
+  _clients[slot].is_term = false;
+  _clients[slot].is_files = false;
+  _clients[slot].meta_sent = false;
+  _clients[slot].lock_sent = 0xFF;
+#if WADA_WEB_FILE_TRANSFER
+  _clients[slot].files_authed = false;
+  _clients[slot].files_close_after_tx = false;
+  _clients[slot].files_request_pending = false;
+  _clients[slot].files_frame_started_ms = 0;
+  _clients[slot].files_auth_failures = 0;
+  _clients[slot].files_rx_len = 0;
+#endif
+  _clients[slot].tx_len = 0;      // drop any stale pending frame from the previous occupant (tx_buf is reused)
+  _clients[slot].tx_sent = 0;
+}
+
 void WebSocketCompanionServer::acceptNewClients() {
   if (!_listening) return;
   while (_server.hasClient()) {
     WiFiClient incoming = _server.accept();
     if (!incoming) continue;
-    int slot = -1;
-    for (int i = 0; i < WS_COMPANION_MAX_CLIENTS; i++) {
-      if (!_clients[i].in_use) {
-        slot = i;
-        break;
-      }
-    }
-    // No free slot: evict the oldest existing client so a fresh connect can
-    // recover from stuck slots (half-closed sockets where connected() still
-    // reports true). Without this, every new connect is accept()ed then
-    // immediately stop()ed, producing SYN/SYN+ACK/ACK/FIN-ACK with zero data.
-    if (slot < 0) {
-      uint32_t now = millis();
-      uint32_t oldest_age = 0;
-      for (int i = 0; i < WS_COMPANION_MAX_CLIENTS; i++) {
-        uint32_t age = now - _clients[i].accept_ms;
-        if (slot < 0 || age > oldest_age) {
-          slot = i;
-          oldest_age = age;
-        }
-      }
-      _clients[slot].client.stop();
-      _clients[slot].in_use = false;
-    }
-    _clients[slot].client = incoming;
-    _clients[slot].in_use = true;
-    _clients[slot].accept_ms = millis();
-    _clients[slot].handshake_done = false;
-    _clients[slot].handshake_len = 0;
-    _clients[slot].ws_state = WS_STATE_HEADER_0;
-    _clients[slot].comp_state = COMP_STATE_IDLE;
-    _clients[slot].stall_ms = 0;
-    _clients[slot].is_mirror = false;
-    _clients[slot].is_term = false;
-    _clients[slot].meta_sent = false;
-    _clients[slot].tx_len = 0;      // drop any stale pending frame from the previous occupant (tx_buf is reused)
-    _clients[slot].tx_sent = 0;
+    adoptClient(incoming);
   }
 }
 
@@ -610,6 +686,28 @@ bool WebSocketCompanionServer::doHandshake(int idx) {
           size_t key_len = key_end - key_start;
           if (key_len == 0 || key_len > 128) break;
 
+          // Route browser endpoints before accepting the upgrade so an unavailable
+          // file-transfer session never observes a successful WebSocket handshake.
+          c->is_mirror = (strncmp(c->handshake_buf, "GET /mirror ", 12) == 0);
+          c->is_term   = (strncmp(c->handshake_buf, "GET /term ", 10) == 0);
+#if WADA_WEB_FILE_TRANSFER
+          c->is_files  = (strncmp(c->handshake_buf, "GET /files ", 11) == 0);
+          bool another_files = false;
+          if (c->is_files) {
+            for (int j = 0; j < WS_COMPANION_MAX_CLIENTS; ++j)
+              if (j != idx && _clients[j].in_use && _clients[j].is_files) another_files = true;
+          }
+          if (c->is_files && (!g_web_file_transfer.enabled() || another_files)) {
+            const char* unavailable = "HTTP/1.1 503 Service Unavailable\r\n"
+                                      "Content-Length: 0\r\nConnection: close\r\n\r\n";
+            writeAllBytes(*cl, reinterpret_cast<const uint8_t*>(unavailable),
+                          strlen(unavailable), TCP_WRITE_TIMEOUT_MS);
+            c->client.stop();
+            c->in_use = false;
+            return false;
+          }
+#endif
+
           char concat[128 + sizeof(WS_MAGIC)];
           memcpy(concat, key_start, key_len);
           memcpy(concat + key_len, WS_MAGIC, sizeof(WS_MAGIC) - 1);
@@ -631,21 +729,24 @@ bool WebSocketCompanionServer::doHandshake(int idx) {
           if (!writeAllBytes(*cl, (const uint8_t*)"\r\n\r\n", 4, TCP_WRITE_TIMEOUT_MS))
             return false;
 
-          // Route GET /mirror to the web-UI mirror channel (display out + pointer
-          // in); every other WS upgrade (the companion app connects to "/") stays
-          // a companion peer on the shared protocol.
-          c->is_mirror = (strncmp(c->handshake_buf, "GET /mirror", 11) == 0);
-          c->is_term   = (strncmp(c->handshake_buf, "GET /term", 9) == 0);   // web mesh terminal socket
-          if (c->is_mirror || c->is_term) c->client.setNoDelay(true);   // low latency: small frames, no Nagle coalescing
+          if (c->is_mirror || c->is_term || c->is_files) c->client.setNoDelay(true);   // low latency: small frames, no Nagle coalescing
           c->meta_sent = false;
+          c->lock_sent = 0xFF;
           c->handshake_done = true;
           c->ws_state = WS_STATE_HEADER_0;
           c->comp_state = COMP_STATE_IDLE;
           return true;
         }
       }
-      // Plain HTTP GET (no WS upgrade): serve the terminal page in terminal mode, else the mirror page.
-      const char* page = g_web_mirror.terminalOn() ? WS_HTML_TERMINAL_PAGE : WS_HTTP_INFO_PAGE;
+      // Plain HTTP GET (no WS upgrade): /files is a runtime-gated transfer page;
+      // the root keeps serving terminal or mirror according to its existing mode.
+      const char* page;
+    #if WADA_WEB_FILE_TRANSFER
+      if (strncmp(c->handshake_buf, "GET /files ", 11) == 0)
+        page = g_web_file_transfer.enabled() ? WS_HTTP_FILES_PAGE : WS_HTTP_FILES_DISABLED;
+      else
+    #endif
+        page = g_web_mirror.terminalOn() ? WS_HTML_TERMINAL_PAGE : WS_HTTP_INFO_PAGE;
       (void)writeAllBytes(*cl, (const uint8_t*)page, strlen(page), TCP_WRITE_TIMEOUT_MS);
       c->client.stop();
       c->in_use = false;
@@ -685,7 +786,7 @@ size_t WebSocketCompanionServer::pollRecvFrame(uint8_t dest[], int* client_index
     }
     // Mirror clients carry framebuffer/pointer traffic, not companion frames —
     // serviceMirror() owns their socket. Never feed their bytes to the parser.
-    if (c->is_mirror || c->is_term) continue;
+    if (c->is_mirror || c->is_term || c->is_files) continue;
 
     WiFiClient* cl = &c->client;
     while (cl->available()) {
@@ -823,7 +924,7 @@ size_t WebSocketCompanionServer::writeToAllClients(const uint8_t src[], size_t l
   int connected = 0;
   int sent = 0;
   for (int i = 0; i < WS_COMPANION_MAX_CLIENTS; i++) {
-    bool ok = _clients[i].in_use && _clients[i].client.connected() && _clients[i].handshake_done && !_clients[i].is_mirror && !_clients[i].is_term;
+    bool ok = _clients[i].in_use && _clients[i].client.connected() && _clients[i].handshake_done && !_clients[i].is_mirror && !_clients[i].is_term && !_clients[i].is_files;
     if (ok) {
       connected++;
       if (writeToClient(i, src, len) == len) sent++;
@@ -836,14 +937,14 @@ bool WebSocketCompanionServer::isClientConnected(int client_index) const {
   WsClientsLock _lk(_client_mtx);
   if (client_index < 0 || client_index >= WS_COMPANION_MAX_CLIENTS) return false;
   const WSClientState* c = &_clients[client_index];
-  return c->in_use && c->client.connected() && c->handshake_done && !c->is_mirror && !c->is_term;
+  return c->in_use && c->client.connected() && c->handshake_done && !c->is_mirror && !c->is_term && !c->is_files;
 }
 
 int WebSocketCompanionServer::connectedCount() const {
   WsClientsLock _lk(_client_mtx);
   int n = 0;
   for (int i = 0; i < WS_COMPANION_MAX_CLIENTS; i++) {
-    if (_clients[i].in_use && _clients[i].client.connected() && _clients[i].handshake_done && !_clients[i].is_mirror && !_clients[i].is_term)
+    if (_clients[i].in_use && _clients[i].client.connected() && _clients[i].handshake_done && !_clients[i].is_mirror && !_clients[i].is_term && !_clients[i].is_files)
       n++;
   }
   return n;
@@ -911,6 +1012,22 @@ void WebSocketCompanionServer::drainClientTx(int idx) {
   WSClientState* c = &_clients[idx];
   if (!c->in_use || c->tx_len == 0) return;
   if (!c->client.connected()) { c->tx_len = c->tx_sent = 0; return; }
+#if defined(HAS_TDISPLAY_P4)
+  // AT transport: write() is a BLOCKING worker round-trip (there is no lwIP buffer to
+  // fill non-blockingly), and we run with _client_mtx held — draining a whole band here
+  // starved the main loop (tickHandshake / pollRecvFrame / mesh) and froze the device.
+  // Send ONE CIPSEND-sized chunk per call; tx_sent resumes next pass. serviceMirror's
+  // all-idle check then also self-limits to one in-flight band. A failed chunk means the
+  // worker already waited out its SEND-OK window (seconds) — retrying a sick browser tab
+  // would stall the whole AT link every pass, so drop the client immediately (the viewer
+  // page auto-reconnects).
+  size_t chunk = c->tx_len - c->tx_sent;
+  if (chunk > 1436) chunk = 1436;   // == c6_at SOCK_PULL_MAX: exactly one AT round-trip
+  size_t n = c->client.write(c->tx_buf + c->tx_sent, chunk);
+  if (n == 0) { disconnectClient(idx); return; }
+  c->tx_sent += (uint16_t)n;
+  if (c->tx_sent >= c->tx_len) { c->tx_len = 0; c->tx_sent = 0; c->stall_ms = 0; }
+#else
   while (c->tx_sent < c->tx_len && socketWritableNow(c->client)) {
     size_t n = c->client.write(c->tx_buf + c->tx_sent, c->tx_len - c->tx_sent);
     if (n == 0) break;
@@ -921,6 +1038,7 @@ void WebSocketCompanionServer::drainClientTx(int idx) {
   // stays unwritable for the full drop window is treated as wedged.
   if (c->stall_ms == 0) c->stall_ms = millis() | 1;
   else if (millis() - c->stall_ms >= WS_WEDGED_DROP_MS) disconnectClient(idx);
+#endif
 }
 
 // Read masked WebSocket binary frames from a mirror client and dispatch pointer
@@ -983,6 +1101,8 @@ void WebSocketCompanionServer::drainMirrorInput(int idx, WebMirror& m) {
               m.requestOrient(c->comp_rx_buf[1] ? 1 : 2);     // 1=landscape, 2=portrait; UI thread reboots into it
             } else if (ty == 0x05) {                          // exit remote mode
               m.requestExit();
+            } else if (ty == 0x06) {                          // unlock the screen (#506)
+              m.requestUnlock();
             }
           } else if (c->ws_opcode == 0x08) {   // client close
             disconnectClient(idx);
@@ -1040,6 +1160,206 @@ void WebSocketCompanionServer::drainTermInput(int idx, WebMirror& m) {
   }
 }
 
+#if WADA_WEB_FILE_TRANSFER
+bool WebSocketCompanionServer::sendFileReply(int idx, const char* text) {
+  if (!text || !text[0]) return false;
+  const size_t len = strlen(text);
+  return writeBinaryFrame(idx, reinterpret_cast<const uint8_t*>(text), len) == len;
+}
+
+// Parse one file-transfer socket. Browser frames are intentionally stop-and-wait:
+// BEGIN -> READY, each binary chunk -> ACK, END -> DONE. That makes the bounded
+// bridge backpressure explicit and prevents the network task from outrunning SD.
+void WebSocketCompanionServer::drainFileInput(int idx) {
+  static constexpr uint32_t kFrameTimeoutMs = 5000;
+  WSClientState* c = &_clients[idx];
+  WiFiClient* cl = &c->client;
+  if (c->ws_state != WS_STATE_HEADER_0 &&
+      millis() - c->files_frame_started_ms > kFrameTimeoutMs) {
+    disconnectClient(idx);
+    return;
+  }
+  if (!c->files_rx_buf) {
+    c->files_rx_buf = static_cast<uint8_t*>(heap_caps_malloc(
+        WebFileTransfer::MAX_INBOUND_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!c->files_rx_buf)
+      c->files_rx_buf = static_cast<uint8_t*>(malloc(WebFileTransfer::MAX_INBOUND_BYTES));
+    if (!c->files_rx_buf) {
+      c->client.stop();
+      c->in_use = false;
+      return;
+    }
+  }
+
+  int guard = 0;
+  while (cl->available() && guard++ < 4096) {
+    switch (c->ws_state) {
+      case WS_STATE_HEADER_0: {
+        const uint8_t b = static_cast<uint8_t>(cl->read());
+        c->files_frame_started_ms = millis();
+        const bool final_frame = (b & 0x80) != 0;
+        const bool reserved_bits = (b & 0x70) != 0;
+        c->ws_opcode = b & 0x0F;
+        if (!final_frame || reserved_bits ||
+            (c->ws_opcode != 0x01 && c->ws_opcode != 0x02 && c->ws_opcode != 0x08)) {
+          disconnectClient(idx);
+          return;
+        }
+        c->ws_state = WS_STATE_HEADER_1;
+        break;
+      }
+      case WS_STATE_HEADER_1: {
+        const uint8_t b = static_cast<uint8_t>(cl->read());
+        if ((b & 0x80) == 0) {   // RFC 6455: every client-to-server frame is masked
+          disconnectClient(idx);
+          return;
+        }
+        const uint8_t len7 = b & 0x7F;
+        if (c->ws_opcode == 0x08 && len7 >= 126) {
+          disconnectClient(idx);
+          return;
+        }
+        c->ws_payload_read = 0;
+        c->files_rx_len = 0;
+        if (len7 == 127) {
+          disconnectClient(idx);
+          return;
+        }
+        if (len7 == 126) {
+          c->ws_payload_len = len7;
+          c->ws_state = WS_STATE_LEN_EXT;
+        } else {
+          c->ws_payload_len = len7;
+          c->ws_state = WS_STATE_MASK;
+        }
+        break;
+      }
+      case WS_STATE_LEN_EXT: {
+        if (c->ws_payload_len == 126) {
+          if (cl->available() < 2) return;
+          const uint8_t hi = static_cast<uint8_t>(cl->read());
+          const uint8_t lo = static_cast<uint8_t>(cl->read());
+          c->ws_payload_len = (static_cast<uint16_t>(hi) << 8) | lo;
+        }
+        if (c->ws_payload_len < 126 ||
+            c->ws_payload_len > WebFileTransfer::MAX_INBOUND_BYTES) {
+          disconnectClient(idx);
+          return;
+        }
+        c->ws_state = WS_STATE_MASK;
+        break;
+      }
+      case WS_STATE_MASK: {
+        if (cl->available() < 4) return;
+        for (int i = 0; i < 4; ++i) c->ws_mask[i] = static_cast<uint8_t>(cl->read());
+        if (c->ws_payload_len == 0) {
+          c->files_frame_started_ms = 0;
+          if (c->ws_opcode == 0x08) {
+            disconnectClient(idx);
+            return;
+          }
+          c->ws_state = WS_STATE_HEADER_0;
+        } else {
+          c->ws_state = WS_STATE_PAYLOAD;
+        }
+        break;
+      }
+      default: {
+        const uint8_t value = static_cast<uint8_t>(cl->read()) ^
+                              c->ws_mask[c->ws_payload_read % 4];
+        if (c->files_rx_len < WebFileTransfer::MAX_INBOUND_BYTES)
+          c->files_rx_buf[c->files_rx_len++] = value;
+        c->ws_payload_read++;
+        if (c->ws_payload_read < c->ws_payload_len) break;
+
+        if (c->ws_opcode == 0x08) {
+          disconnectClient(idx);
+          return;
+        }
+        if (c->ws_payload_len > WebFileTransfer::MAX_INBOUND_BYTES) {
+          if (c->tx_len == 0) sendFileReply(idx, "ERR frame too large");
+        } else if (!c->files_authed) {
+          const bool allowed = g_web_file_transfer.authAllowed();
+          const bool auth = allowed && c->ws_opcode == 0x01 && c->files_rx_len == 11 &&
+                            memcmp(c->files_rx_buf, "AUTH ", 5) == 0 &&
+                            g_web_file_transfer.matchesCode(c->files_rx_buf + 5, 6);
+          if (auth) {
+            c->files_authed = true;
+            c->files_auth_failures = 0;
+            g_web_file_transfer.noteAuthSuccess();
+            if (c->tx_len == 0) sendFileReply(idx, "AUTH OK");
+          } else {
+            c->files_auth_failures++;
+            if (allowed) g_web_file_transfer.noteAuthFailure();
+            if (c->tx_len == 0)
+              sendFileReply(idx, allowed ? "ERR invalid code" : "ERR try again in 30 seconds");
+            if (c->files_auth_failures >= 3) c->files_close_after_tx = true;
+          }
+        } else if ((c->ws_opcode == 0x01 || c->ws_opcode == 0x02) &&
+                   c->files_rx_len > 0) {
+          if (g_web_file_transfer.pushInbound(c->ws_opcode, c->files_rx_buf,
+                                               c->files_rx_len)) {
+            c->files_request_pending = true;
+          } else if (c->tx_len == 0) {
+            sendFileReply(idx, "ERR device busy");
+          }
+        }
+        c->ws_state = WS_STATE_HEADER_0;
+        c->files_frame_started_ms = 0;
+        return;   // one complete application frame per service pass
+      }
+    }
+  }
+}
+
+void WebSocketCompanionServer::serviceFileClients() {
+  int clients = 0;
+  int active = -1;
+  for (int i = 0; i < WS_COMPANION_MAX_CLIENTS; ++i) {
+    WSClientState* c = &_clients[i];
+    if (!c->in_use || !c->client.connected() || !c->handshake_done || !c->is_files) continue;
+    clients++;
+    active = i;
+    drainClientTx(i);
+    if (!c->in_use) continue;
+    if (!g_web_file_transfer.enabled()) {
+      if (c->tx_len == 0) sendFileReply(i, "ERR session ended");
+      c->files_close_after_tx = true;
+    } else if (!c->files_request_pending && c->tx_len == 0) {
+      drainFileInput(i);
+    }
+    if (c->in_use && c->files_close_after_tx && c->tx_len == 0) disconnectClient(i);
+  }
+  g_web_file_transfer.noteClients(clients);
+
+  if (active < 0 || !_clients[active].in_use || !_clients[active].files_authed ||
+      _clients[active].tx_len != 0) return;
+  uint8_t reply[WebFileTransfer::MAX_REPLY_BYTES];
+  const size_t len = g_web_file_transfer.popReply(reply, sizeof reply);
+  if (len > 0) {
+    if (writeBinaryFrame(active, reply, len) == len) {
+      _clients[active].files_request_pending = false;
+    } else {
+      char retry[WebFileTransfer::MAX_REPLY_BYTES];
+      memcpy(retry, reply, len);
+      retry[len] = '\0';
+      g_web_file_transfer.pushReply(retry);
+    }
+    return;
+  }
+  if (!_mirror_txbuf) return;
+  const size_t data_len = g_web_file_transfer.popData(
+      _mirror_txbuf, WebFileTransfer::MAX_OUTBOUND_BYTES);
+  if (data_len > 0) {
+    if (writeBinaryFrame(active, _mirror_txbuf, data_len) == data_len) {
+      _clients[active].files_request_pending = false;
+    } else {
+      g_web_file_transfer.pushData(_mirror_txbuf, data_len);
+    }
+  }
+}
+#endif
+
 // Web mesh terminal: shuttle text both ways for /term clients (independent of the
 // framebuffer mirror; a client is never both). Called from serviceMirror on the stream
 // task with _client_mtx already held. writeBinaryFrame's per-client tx_buf keeps it
@@ -1081,6 +1401,9 @@ void WebSocketCompanionServer::serviceMirror(WebMirror& m) {
     _mirror_txbuf = (uint8_t*)heap_caps_malloc(WS_MIRROR_TXBUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!_mirror_txbuf) _mirror_txbuf = (uint8_t*)malloc(WS_MIRROR_TXBUF);
   }
+#if WADA_WEB_FILE_TRANSFER
+  serviceFileClients();                    // authenticated browser upload channel
+#endif
   serviceTerminalClients(m);               // web mesh terminal + Contacts/Chats data (independent of the framebuffer)
   const int mc = mirrorClientCount();
   m.noteClients(mc);
@@ -1104,6 +1427,12 @@ void WebSocketCompanionServer::serviceMirror(WebMirror& m) {
       if (writeBinaryFrame(i, meta, 6) == 6) { c->meta_sent = true; m.requestFullRepaint(); }
     }
     if (kb_changed && c->tx_len == 0) { uint8_t km[2] = { 0x03, (uint8_t)(kf ? 1 : 0) }; writeBinaryFrame(i, km, 2); }
+    // Lock state, tracked per browser so a late joiner or a busy link still gets it.
+    const uint8_t lk = m.locked() ? 1 : 0;
+    if (c->meta_sent && c->tx_len == 0 && c->lock_sent != lk) {
+      uint8_t lm[2] = { 0x06, lk };
+      if (writeBinaryFrame(i, lm, 2) == 2) c->lock_sent = lk;
+    }
     drainMirrorInput(i, m);
   }
 

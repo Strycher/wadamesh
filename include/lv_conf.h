@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef LV_CONF_H
+#define LV_CONF_H
+#endif
+
 #define LV_COLOR_DEPTH 16
 #define LV_COLOR_16_SWAP 0
 
@@ -52,13 +56,20 @@
 #define LV_FONT_MONTSERRAT_12 1
 #define LV_FONT_MONTSERRAT_14 1
 #define LV_FONT_MONTSERRAT_16 1
-/* Larger Montserrat sizes for the Tanmatsu's crisp "UI size" (Large/Huge) — render the UI bigger
- * at native resolution instead of upscaling a low-res frame. Gated to the Tanmatsu so the
- * flash-tighter S3 touch builds don't pay for fonts they never use. */
-#if defined(HAS_TANMATSU)
+/* Larger Montserrat sizes for crisp UI/text-size presets at native resolution. The P4 boards scale
+ * text and geometry; V4-R8 uses the same fonts without geometry scaling. Other flash-tighter S3
+ * builds don't pay for fonts they never use. (Match board macros because device_caps.h isn't here.) */
+#if defined(HAS_TANMATSU) || defined(HAS_TDISPLAY_P4) || defined(HELTEC_LORA_V4_R8)
 #define LV_FONT_MONTSERRAT_18 1
 #define LV_FONT_MONTSERRAT_20 1
 #define LV_FONT_MONTSERRAT_24 1
+#endif
+/* T-Deck-only, unrelated to the Large/Huge UI-scale block above: an experiment
+ * to shrink the "at a glance" notification's message body from 28px to 20px
+ * on this board only (see atGlanceEnsureFont() in UITask.cpp). Easy to revert
+ * by dropping this block + the T-Deck branch in atGlanceEnsureFont(). */
+#if defined(HAS_TDECK_GT911)
+#define LV_FONT_MONTSERRAT_20 1
 #endif
 /* 28 px Montserrat for the boot splash title — keeps the rest of the UI on
  * the smaller fonts so the .data cost stays modest. */

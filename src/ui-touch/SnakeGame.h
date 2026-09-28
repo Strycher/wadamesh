@@ -6,9 +6,10 @@
 // Self-contained Snake mini-game launched from the Apps drawer.
 //
 // Owns a full-screen overlay on lv_layer_top: a canvas playfield filling the
-// unoccupied screen, a score line, and a close button. The game waits on a
-// "New game" button (doesn't start moving on open). Steer by swipe OR trackball
-// (UITask routes the trackball here via isOpen()/steer() and hides the cursor);
+// unoccupied screen, a score line, and a close button. The game can start from
+// the "New game" button OR from the first directional steer input. Steer by
+// swipe/gesture, trackball, or hardware directional keys (UITask routes board
+// input here via isOpen()/steer());
 // tap to restart after a game over; the X closes it. One instance at a time.
 //
 // Decoupled from UITask internals — depends only on LVGL and lvglPsramAlloc.
@@ -17,8 +18,14 @@ public:
   static void launch();                 // open (no-op if already open)
   static bool isOpen();                 // UITask: gate the trackball + tab bar
   static void steer(int dx, int dy);    // UITask: trackball motion -> direction
+  // THE close path. Installed as the AppPage back hook (see appPageBegin), so the tall
+  // "< Snake" bar closes the game. Plain void() on purpose — that is what appPageBegin
+  // takes. Safe from an event callback: root and instance are torn down asynchronously.
+  static void dismiss();
 
 private:
+  ~SnakeGame();   // frees the canvas buffer, after the queued root delete released the canvas
+
   // The playfield grid is sized to the screen at open() (cols_ x rows_), capped
   // by these maxima so the body arrays are fixed-size.
   static constexpr int kCellPx   = 14;  // px per cell
@@ -61,7 +68,7 @@ private:
   static void timerCb(lv_timer_t* t);
   static void gestureCb(lv_event_t* e);
   static void tapCb(lv_event_t* e);
-  static void closeCb(lv_event_t* e);
   static void startCb(lv_event_t* e);
   static void pauseCb(lv_event_t* e);
+  static void destroyAsync(void* p);    // lv_async_call target: delete the instance
 };
