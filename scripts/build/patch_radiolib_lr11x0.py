@@ -25,6 +25,25 @@ Import("env")
 import os
 
 MARKER = "wadamesh-lr1110-oldfw-patch"
+
+# RadioLib 7.8.x fixed this upstream, gating the call on the transceiver
+# firmware version instead of needing our patch at all:
+#
+#   if(!((this->versionDevice == RADIOLIB_LR11X0_DEVICE_LR1110) &&
+#        (this->versionCombined < 0x0306))) {
+#     state = this->driveDiosInSleepMode(true);
+#
+# When that guard is present there is nothing to patch, so the build must NOT
+# abort. Before this check, a RadioLib >= 7.8.1 resolved by the `^7.6.0` caret
+# range failed every M9 build with "doesn't match the expected shape".
+#
+# CAVEAT (#76): upstream skips only below firmware 0x0306, while our patch
+# swallowed CMD_PERR at any version and this file's header cites 0x0308 as the
+# cutoff. A preprod LR1110 in the 0x0306-0x0308 window would therefore still
+# fail init (-706) on stock RadioLib. Unverified either way - no M9 hardware
+# has been tested against 7.8.x.
+UPSTREAM_GUARD = "(this->versionCombined < 0x0306)"
+
 OLD = """  state = this->driveDiosInSleepMode(true);
   RADIOLIB_ASSERT(state);"""
 NEW = """  state = this->driveDiosInSleepMode(true);
@@ -49,6 +68,10 @@ def apply_patch():
         src = f.read()
     if MARKER in src:
         print("[patch_radiolib_lr11x0] already patched")
+        return None
+    if UPSTREAM_GUARD in src:
+        print("[patch_radiolib_lr11x0] RadioLib already gates driveDiosInSleepMode "
+              "on the transceiver FW version - nothing to patch (see #76)")
         return None
     if OLD not in src:
         # lib_deps uses a caret range (^7.6.0), so a `pio pkg update` can pull
@@ -84,8 +107,11 @@ def verify_patched(target, source, env):
         print("[patch_radiolib_lr11x0] ERROR: %s still missing at link time" % path)
         return 1
     with open(path) as f:
-        if MARKER in f.read():
-            return 0
+        src = f.read()
+    if MARKER in src or UPSTREAM_GUARD in src:
+        # Either our patch landed, or RadioLib already gates the call itself.
+        # Both mean no unpatched binary can ship.
+        return 0
     error = apply_patch()
     if error is not None:
         print("[patch_radiolib_lr11x0] ERROR: %s" % error)
