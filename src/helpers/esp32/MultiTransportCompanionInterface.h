@@ -30,7 +30,9 @@ public:
   void stopTcpServer();   // stop TCP server and disconnect clients; prevents startTcpServer until enableTcp()
 
 #ifdef BLE_PIN_CODE
-  // Call after begin() and the_mesh is ready (e.g. after startInterface). Enables BLE by default.
+  // Call after begin() and the_mesh is ready (e.g. after startInterface).
+  // Creates and enables BLE; BLE-off Pager boots deliberately avoid a dormant
+  // NimBLE allocation so Wi-Fi retains its normal reconnect path.
   void beginBle(const char* prefix, char* name, uint32_t pin_code);
   // Store the BLE name/pin WITHOUT bringing the stack up. Used at boot when the
   // heap guard defers co-initialising BLE alongside Wi-Fi: the params are kept so
@@ -38,8 +40,28 @@ public:
   void prepareBle(const char* prefix, char* name, uint32_t pin_code);
   void enableBle() override;
   void disableBle() override;
+#if defined(TLORA_PAGER)
+  // Quiesce BLE without changing the saved intent or destroying its bond/GATT
+  // state. Wi-Fi can then re-associate before enableBle() resumes advertising.
+  bool suspendBleForWifiReconnect();
+#endif
   bool isBleEnabled() const override { return _ble_enabled; }
+  bool isBleStackBegun() const { return _ble_begun; }
+  // Keyboard mode: Bluetooth stays on for an external keyboard, but the phone-app
+  // link is dropped and no longer advertised. The saved on/off preference is not
+  // touched, so switching back resumes the phone link as it was.
+  void setBlePhoneLinkPaused(bool paused);
+  bool isBlePhoneLinkPaused() const { return _ble_phone_paused; }
+#if defined(HAS_TDISPLAY_P4)
+  // T-Display P4: the factory C6 ESP-AT firmware has its BLE advertising commands stubbed
+  // (BLEADVDATA/ADVSTART all ERROR — Meck-P4 hit the same wall and ships Wi-Fi companion), and
+  // reflashing the C6 is ruled out for users. Phone pairing on this board = Wi-Fi (TCP:5000) or
+  // USB; the UI hides its Bluetooth toggles off this. The MeshCore GATT table stays pre-provisioned
+  // on the C6 (c6_at) so a future LilyGo AT firmware with working advertising lights up cheaply.
+  bool hasBleCapability() const override { return false; }
+#else
   bool hasBleCapability() const override { return true; }
+#endif
   bool getBlePeerAddress(char* buf, size_t len) const override;
 #endif
 
@@ -47,7 +69,13 @@ public:
   void disableTcp() override;
   bool isTcpEnabled() const override { return _tcp_enabled; }
   bool isWsStarted() const override { return _ws_started; }
+#if defined(HAS_TDISPLAY_P4)
+  // The web UI shares the companion TCP port (single AT listener + first-byte router),
+  // so that's the port to show/open — _ws_port is never listened on here.
+  uint16_t getWsPort() const override { return _tcp_port; }
+#else
   uint16_t getWsPort() const override { return _ws_port; }
+#endif
   int getWsConnectedCount() const override { return _ws.connectedCount(); }
   /** Accept WebSocket clients / handshakes; call from main loop. */
   void tickWebSocketHandshake() override;
@@ -71,6 +99,13 @@ public:
    *  gets exactly the few frames the app needs and none of the flood (#94).
    *  Same-thread set-then-consume (both in the mesh loop), so no atomics. */
   static void bleAllowNextRxLog() { s_ble_rxlog_once = true; }
+  /** Opt a BLE companion into the FULL per-packet RX log (#256).
+   *  Off by default and NOT persisted: an app asks for it after connecting, via
+   *  CMD_SET_CUSTOM_VAR "ble.rxlog:1". Deliberately session-scoped — a stored
+   *  flag would silently reinstate the #46/#54 flood for someone who tried a
+   *  coverage app once and moved on, on a link that cannot afford it. */
+  static void bleSetRxLogFirehose(bool on) { s_ble_rxlog_all = on; }
+  static bool bleRxLogFirehose() { return s_ble_rxlog_all; }
   bool companionUnsolicitedPushesBroadcastToAll() const override { return _broadcast; }
   size_t checkRecvFrame(uint8_t dest[]) override;
 
@@ -82,6 +117,7 @@ public:
 
 private:
   static bool s_ble_rxlog_once;   // one-shot BLE pass for the next RX-log frame (#94)
+  static bool s_ble_rxlog_all;    // app opted into the whole RX log over BLE (#256); session-scoped
 public:
 
 private:
@@ -95,6 +131,18 @@ private:
   uint16_t _ws_port;
   bool _tcp_started;
   bool _ws_started;
+#if defined(HAS_TDISPLAY_P4)
+  // ESP-AT allows ONE listening port, so this router server owns it: every inbound
+  // connection is accepted here, held briefly, and dispatched on its first byte —
+  // an HTTP verb ('G','H','P','O','D') goes to _ws (web mirror/VNC/remote/terminal +
+  // WS companion), everything else ('<' companion frames) to _tcp (phone app).
+  // _tcp/_ws never begin() their own listeners on this board (their C6Server stays
+  // inert); they receive clients via adoptClient().
+  WiFiServer _p4_srv;
+  struct P4PendingClient { WiFiClient c; uint32_t ms = 0; bool used = false; };
+  P4PendingClient _p4_pend[3];
+  void p4RouteClients();
+#endif
   void* _mirror_task = nullptr;   // TaskHandle_t for the core-0 web-mirror stream task (created once)
   bool _tcp_enabled;   // if false, startTcpServer() no-ops until enableTcp()
   bool _isEnabled;
@@ -106,8 +154,10 @@ private:
 #ifdef BLE_PIN_CODE
   SerialBLEInterface _ble;
   bool _ble_begun;    // beginBle() was called
+  bool _ble_phone_paused = false;   // keyboard mode: no phone link, stack still up
   bool _ble_enabled;  // user has BLE on (toggle via UI)
   bool _ota_ble_released;
+  bool _ota_ble_was_enabled;
   char _ble_prefix[24];
   char _ble_name[48];
   uint32_t _ble_pin_code;

@@ -1,4 +1,5 @@
 #include "MyMesh.h"
+#include <esp_heap_caps.h>
 
 #include <Arduino.h> // needed for PlatformIO
 #include <Mesh.h>
@@ -7,15 +8,23 @@
 #include <SHA256.h>   // derive a region's flood-scope key from its #hashtag name
 #include <time.h>     // gmtime_r for the "clock" CLI command
 #ifdef ESP32
+#include <mbedtls/base64.h>   // "fadd" serial-sideload chunks
+#endif
+#ifdef ESP32
 #include <esp_system.h>          // esp_restart for the "bootloader" CLI command
-#if !defined(HAS_TANMATSU)
-#include <soc/rtc_cntl_reg.h>    // RTC_CNTL_OPTION1_REG / FORCE_DOWNLOAD_BOOT (S3-only; P4 lacks it)
+#if !defined(HAS_TANMATSU) && !defined(HAS_TDISPLAY_P4)
+#include <soc/rtc_cntl_reg.h>    // RTC_CNTL_OPTION1_REG / FORCE_DOWNLOAD_BOOT (S3-only; both P4 boards lack it)
 #endif
 #endif
 #include <helpers/AdvertDataHelpers.h>
+#include "helpers/CompanionRetryPolicy.h"
+#include "helpers/esp32/WdtHeavyGuard.h"   // eviction blob deletes are SPIFFS-GC-prone (#222)
 #include <helpers/HttpOtaDisplayState.h>
 #include <helpers/RepeaterTcpOtaEmit.h>
 #include "WiFiConfig.h"
+#if defined(ESP32) && defined(HAS_TOUCH_UI)
+#include "helpers/esp32/TouchPrefsStore.h"
+#endif
 #ifdef ESP32
 #if defined(WIFI_SSID) || defined(MULTI_TRANSPORT_COMPANION)
 #include <WiFi.h>
@@ -28,10 +37,23 @@
 #endif
 #endif
 
+// True while the USB Files app owns the USB serial port (ui-touch/UsbFilesSession.h).
+// Defined in UITask.cpp, which every target builds.
+extern volatile bool g_usb_files_owns_serial;
+
 #if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
 /** While `ota url` runs, pin WS/TCP reply target so OTA progress survives yield() and checkRecvFrame. */
 static int s_companion_ota_pinned_reply_target = -1;
 #endif
+
+static void persistProtocolClockBeforeReset(mesh::RTCClock* clock) {
+#if defined(ESP32) && defined(HAS_TOUCH_UI)
+  if (clock) touchPrefsSetClockFloor(clock->getCurrentTime());
+  touchPrefsFlush();
+#else
+  (void)clock;
+#endif
+}
 
 #define CMD_APP_START                 1
 #define CMD_SEND_TXT_MSG              2
@@ -137,11 +159,28 @@ static int s_companion_ota_pinned_reply_target = -1;
 #define DIRECT_SEND_PERHOP_FACTOR       6.0f
 #define DIRECT_SEND_PERHOP_EXTRA_MILLIS 250
 #define LAZY_CONTACTS_WRITE_DELAY       5000
+// Companion sync-history persistence pacing (see serviceSyncHistory). The log append
+// is a ~180 B write per message, so it lands quickly — the coalesce is the hard-cut
+// loss window. Cursor rewrites (tmp + swap of a ~300 B file) happen on every synced
+// or live-pushed message while an app is connected, so they coalesce longer; a stale
+// cursor only costs the app a few re-delivered (already-seen) messages, never loss.
+#define SYNC_HIST_LOG_COALESCE_MS       3000
+#define SYNC_HIST_LOG_MAX_LATENCY_MS    10000
+#define SYNC_HIST_CUR_COALESCE_MS       5000
+#define SYNC_HIST_CUR_MAX_LATENCY_MS    30000
+#define SYNC_HIST_RETRY_MS              30000   // storage unavailable / write failed
+#define SYNC_HIST_LOG_FILE              "/synchist"
+#define SYNC_HIST_LOG_TMP               "/synchist.tmp"
+#define SYNC_HIST_CUR_FILE              "/synccur"
+#define SYNC_HIST_CUR_TMP               "/synccur.tmp"
 // On card-less (internal-flash) devices, coalesce advert-refresh contacts saves to
 // at most once per this window — a full rewrite can trigger a multi-second SPIFFS GC
 // that freezes the loop, and re-adverts (last-heard/path refreshes) otherwise churn
 // it constantly. A change in the contact SET still saves promptly (see MyMesh::loop).
 #define CONTACTS_REFRESH_SAVE_INTERVAL  300000
+// Minimum gap between contacts saves that were triggered by an ADD/REMOVE (count change).
+// Coalesces a burst of newly-heard nodes into one atomic rewrite instead of one per node.
+#define CONTACTS_ADD_SAVE_MIN_INTERVAL   30000
 // Our self-chosen room-session keep-alive interval (secs). Room servers zero the
 // legacy suggested-interval field in LOGIN_OK, so the client picks. 128 is the
 // value upstream itself recommended while the field was live (CLIENT_KEEP_ALIVE_SECS
@@ -257,11 +296,100 @@ static const char* kMeshcomodHelpMsg =
   "set tx <dBm>        set TX power\n"
   "wifi status|on|off|scan\n"
   "wifi use <n> | set ssid <v> | set pwd <v> | apply | clear\n"
+  "mqtt status\n"
   "tcp status|on|off\n"
   "ble status|on|off\n"
   "ota status|start|netdiag | ota url <https://...bin>\n"
   "reboot              restart the device\n"
   "bootloader / dfu    reboot to download mode";
+
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+static const char* mqttResultText(int result) {
+  switch (result) {
+    case -4: return "connection timeout";
+    case -3: return "connection lost";
+    case -2: return "TCP connect failed";
+    case -1: return "disconnected";
+    case  0: return "connected";
+    case  1: return "bad protocol";
+    case  2: return "rejected client ID";
+    case  3: return "broker unavailable";
+    case  4: return "bad credentials";
+    case  5: return "unauthorized";
+    default: return "unknown";
+  }
+}
+
+static void mqttFormatAge(char* out, size_t cap, uint32_t timestamp, uint32_t now) {
+  if (!timestamp) { snprintf(out, cap, "never"); return; }
+  const uint32_t seconds = (uint32_t)(now - timestamp) / 1000u;
+  if (seconds < 60u) snprintf(out, cap, "%lus ago", (unsigned long)seconds);
+  else if (seconds < 3600u) snprintf(out, cap, "%lum %lus ago",
+                                    (unsigned long)(seconds / 60u),
+                                    (unsigned long)(seconds % 60u));
+  else snprintf(out, cap, "%luh %lum ago", (unsigned long)(seconds / 3600u),
+                (unsigned long)((seconds / 60u) % 60u));
+}
+
+static void mqttFormatStatus(char* out, size_t cap) {
+  MqttBridgeStatus status;
+  mqtt_bridge.getStatus(status);
+  if (!status.available) {
+    snprintf(out, cap, "mqtt: unavailable on this build");
+    return;
+  }
+  if (status.phase == MqttBridgePhase::Disabled) {
+    snprintf(out, cap, "mqtt: disabled");
+    return;
+  }
+  if (status.phase == MqttBridgePhase::Misconfigured) {
+    snprintf(out, cap, "mqtt: misconfigured (broker host is empty)");
+    return;
+  }
+
+  const uint32_t now = millis();
+  char state[64];
+  char timing[96] = {};
+  switch (status.phase) {
+    case MqttBridgePhase::WaitingForWifi:
+      snprintf(state, sizeof(state), "mqtt: waiting for Wi-Fi");
+      break;
+    case MqttBridgePhase::Connecting: {
+      char age[32];
+      mqttFormatAge(age, sizeof(age), status.lastAttemptMs, now);
+      snprintf(state, sizeof(state), "mqtt: connecting");
+      snprintf(timing, sizeof(timing), "attempt: %s", age);
+      break;
+    }
+    case MqttBridgePhase::Connected: {
+      char age[32];
+      mqttFormatAge(age, sizeof(age), status.lastConnectedMs, now);
+      snprintf(state, sizeof(state), "mqtt: connected");
+      snprintf(timing, sizeof(timing), "connected: %s", age);
+      break;
+    }
+    case MqttBridgePhase::RetryWait: {
+      const int32_t remaining = (int32_t)(status.retryAtMs - now);
+      const uint32_t seconds = remaining > 0 ? ((uint32_t)remaining + 999u) / 1000u : 0u;
+      snprintf(state, sizeof(state), "mqtt: retrying (%lus)", (unsigned long)seconds);
+      if (status.lastResultMs) {
+        char age[32];
+        mqttFormatAge(age, sizeof(age), status.lastResultMs, now);
+        snprintf(timing, sizeof(timing), "last error: %d (%s), %s",
+                 (int)status.lastResult, mqttResultText(status.lastResult), age);
+      }
+      break;
+    }
+    default:
+      snprintf(state, sizeof(state), "mqtt: unavailable on this build");
+      break;
+  }
+  snprintf(out, cap, "%s\nbroker: %s:%u\npublish: channels=%s dm=%s encrypted=%s%s%s",
+           state, status.host, (unsigned)status.port,
+           status.publishChannel ? "on" : "off", status.publishDm ? "on" : "off",
+           status.encrypted ? "yes" : "no", timing[0] ? "\n" : "", timing);
+}
+#endif
 
 #define MESHCOMOD_CMD_CACHE_SIZE 6
 struct MeshcomodCmdCacheEntry {
@@ -547,11 +675,32 @@ bool MyMesh::handleMeshcomodCommand(const char* text, int text_len) {
     return true;
   }
   if (isCmd(p, "clock") || isCmd(p, "time")) {
-    time_t tt = (time_t)getRTCClock()->getCurrentTime();
-    struct tm tmv; gmtime_r(&tt, &tmv);
-    char r[64];
-    snprintf(r, sizeof r, "clock: %04d-%02d-%02d %02d:%02d:%02d UTC",
-             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    char r[192];
+    int n = 0;
+#if defined(ESP32)
+    if (!rtc_clock.timeIsCurrent()) {
+      n = snprintf(r, sizeof r, "clock: unavailable\nuptime: %lus\nbuild: %s",
+                   (unsigned long)(millis() / 1000u), FIRMWARE_BUILD_DATE);
+    } else
+#endif
+    {
+      time_t tt = (time_t)getRTCClock()->getCurrentTime();
+      struct tm tmv; gmtime_r(&tt, &tmv);
+      n = snprintf(r, sizeof r, "clock: %04d-%02d-%02d %02d:%02d:%02d UTC",
+                   tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                   tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    }
+#if defined(ESP32)
+    // Where that value came from, and whether the board's RTC chip vouches for
+    // itself (#383). A frozen clock and a live one print the same digits, so the
+    // digits alone were never a diagnosis.
+    n += snprintf(r + n, sizeof r - n, "\nsource: %s", rtc_clock.sourceName());
+#if defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9)
+    snprintf(r + n, sizeof r - n, "\nrtc: %s %s%s", hw_rtc.chipName(),
+             HardwareRtcClock::statusName(hw_rtc.status()),
+             hw_rtc.writeConfirmed() ? " (write verified)" : "");
+#endif
+#endif
     pushMeshcomodReply(r);
     return true;
   }
@@ -566,6 +715,7 @@ bool MyMesh::handleMeshcomodCommand(const char* text, int text_len) {
   if (isCmd(p, "reboot")) {
     pushMeshcomodReply("rebooting...");
     delay(150);
+    persistProtocolClockBeforeReset(getRTCClock());
     board.reboot();
     return true;   // not reached
   }
@@ -586,10 +736,11 @@ bool MyMesh::handleMeshcomodCommand(const char* text, int text_len) {
     // rest of RTC_CNTL_OPTION1 and wedges the RTC so esp_restart() hangs instead
     // of resetting (that was the earlier "freeze"). board.reboot() == esp_restart,
     // the proven reset path on this board; the RTC bit survives it.
-#if !defined(HAS_TANMATSU)
+#if !defined(HAS_TANMATSU) && !defined(HAS_TDISPLAY_P4)
     uint32_t opt1 = REG_READ(RTC_CNTL_OPTION1_REG);
     REG_WRITE(RTC_CNTL_OPTION1_REG, opt1 | RTC_CNTL_FORCE_DOWNLOAD_BOOT);
 #endif
+    persistProtocolClockBeforeReset(getRTCClock());
     board.reboot();   // Tanmatsu/P4: plain reboot (the launcher manages flashing)
 #else
     pushMeshcomodReply("bootloader: ESP32-only");
@@ -637,6 +788,10 @@ bool MyMesh::handleMeshcomodCommand(const char* text, int text_len) {
           snprintf(ble, sizeof(ble), "on (%s)", peer);
         else
           snprintf(ble, sizeof(ble), "on");
+#if defined(TLORA_PAGER)
+      } else if (wifiConfigGetBleEnabled()) {
+        snprintf(ble, sizeof(ble), "pending");
+#endif
       } else {
         snprintf(ble, sizeof(ble), "off");
       }
@@ -668,6 +823,23 @@ bool MyMesh::handleMeshcomodCommand(const char* text, int text_len) {
     char status_basic[180];
     snprintf(status_basic, sizeof(status_basic), "companion status:\nusb: on\nble: %s\ntcp: %s\n%s", ble, tcp, ws_line);
     pushMeshcomodReply(status_basic);
+    return true;
+  }
+
+  if (isCmd(p, "mqtt")) {
+    const char* q = p + 4;
+    while (*q == ' ' || *q == '\t') q++;
+    if (isCmd(q, "status")) {
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+      char reply[320];
+      mqttFormatStatus(reply, sizeof(reply));
+      pushMeshcomodReply(reply);
+#else
+      pushMeshcomodReply("mqtt: unavailable on this build");
+#endif
+      return true;
+    }
+    pushMeshcomodReply("usage:\n- mqtt status");
     return true;
   }
 
@@ -703,8 +875,24 @@ bool MyMesh::handleMeshcomodCommand(const char* text, int text_len) {
     p += 3;
     while (*p == ' ' || *p == '\t') p++;
     if (strncasecmp(p, "on", 2) == 0 && (p[2] == '\0' || p[2] == ' ' || p[2] == '\t')) {
+#if defined(TLORA_PAGER)
+      // Record the request before asking the transport. A cold start may be
+      // intentionally refused while WPA owns the Pager coexistence handoff;
+      // main.cpp observes this preference and restores BLE on success/timeout.
+      wifiConfigSetBleEnabled(true);
+#endif
       _serial->enableBle();
-      pushMeshcomodReply("OK\nble: on");
+      if (_serial->isBleEnabled()) {
+        pushMeshcomodReply("OK\nble: on");
+#if defined(TLORA_PAGER)
+      } else if (wifiConfigPagerWifiBlocksBle()) {
+        pushMeshcomodReply("OK\nble: pending (Wi-Fi handoff)");
+      } else if (wifiConfigGetBleEnabled()) {
+        pushMeshcomodReply("ble: pending (retry from Settings)");
+#endif
+      } else {
+        pushMeshcomodReply("error: Bluetooth could not start");
+      }
       return true;
     }
     if (strncasecmp(p, "off", 3) == 0 && (p[3] == '\0' || p[3] == ' ' || p[3] == '\t')) {
@@ -725,6 +913,10 @@ bool MyMesh::handleMeshcomodCommand(const char* text, int text_len) {
         } else {
           pushMeshcomodReply("ble: on");
         }
+#if defined(TLORA_PAGER)
+      } else if (wifiConfigGetBleEnabled()) {
+        pushMeshcomodReply("ble: pending");
+#endif
       } else {
         pushMeshcomodReply("ble: off");
       }
@@ -903,14 +1095,35 @@ bool MyMesh::handleMeshcomodCommand(const char* text, int text_len) {
       pushMeshcomodReply("error: wifi radio off — send wifi on first");
       return true;
     }
+    if (wifiScanIsActive()) {
+      pushMeshcomodReply("wifi: scan already in progress");
+      return true;
+    }
     // Ensure STA is fully up before scan; disconnected STA needs a bit more settle time.
     wifi_mode_t mode = WiFi.getMode();
+#if defined(TLORA_PAGER)
+    // Never cold-initialize Wi-Fi from a command handler while NimBLE is
+    // resident. The main loop performs the ordered live handoff; a subsequent
+    // command can scan once that short transition has completed.
+    if ((mode & WIFI_MODE_STA) == 0) {
+      wifiConfigRequestApply();
+      pushMeshcomodReply("wifi: starting; retry scan shortly");
+      return true;
+    }
+    if (wifiConfigPagerWifiBlocksBle()) {
+      pushMeshcomodReply("wifi: association in progress; retry scan shortly");
+      return true;
+    }
+    delay(40);
+#else
     if ((mode & WIFI_MODE_STA) == 0) {
       WiFi.mode(WIFI_STA);
       delay(180);
     } else {
       delay(40);
     }
+#endif
+    wifiScanSetActive(true);
     s_meshcomod_scan_count = 0;
     // Watchdog-safe: one bounded, yielding async pass (see wifiScanWatchdogSafe).
     // This handler runs on the main/loop task, so the old twin synchronous scans
@@ -919,6 +1132,7 @@ bool MyMesh::handleMeshcomodCommand(const char* text, int text_len) {
     if (found <= 0) {
       pushMeshcomodReply("scan: no networks (2.4GHz only)");
       WiFi.scanDelete();
+      wifiScanSetActive(false);
       return true;
     }
     String scanMsg = "scan results:";
@@ -963,6 +1177,7 @@ bool MyMesh::handleMeshcomodCommand(const char* text, int text_len) {
       pushMeshcomodReply(scanMsg.c_str());
     }
     WiFi.scanDelete();
+    wifiScanSetActive(false);
     return true;
   }
   if (strncasecmp(p, "use", 3) == 0 && (p[3] == '\0' || p[3] == ' ' || p[3] == '\t')) {
@@ -1109,7 +1324,228 @@ uint32_t MyMesh::addToHistoryRing(const uint8_t frame[], int len) {
   if (history_count < HISTORY_RING_SIZE) {
     history_count++;
   }
+  // Every add counts as unflushed (appendSyncLog walks the newest N ring slots and
+  // skips non-message codes itself); only message frames arm a write.
+  if (_synchist_unflushed < HISTORY_RING_SIZE) _synchist_unflushed++;
+  if (isSyncMessageCode(frame[0])) markSyncLogDirty();
   return assigned;
+}
+
+// ---------------------------------------------------------------------------
+// Companion sync-history persistence (ring + per-client cursors). File formats:
+//   /synchist : "WSH" 0x01, then records { u32 seq, u8 len, u8 buf[len] } oldest first.
+//   /synccur  : "WSC" 0x01, u32 next_seq, u8 n, then n x { char id[MAX_CLIENT_ID_LEN+1], u32 last_seq }.
+// Little-endian, packed by hand (no struct dumps) so the layout is explicit.
+// ---------------------------------------------------------------------------
+static const uint8_t kSyncHistMagic[4] = { 'W', 'S', 'H', 1 };
+static const uint8_t kSyncCurMagic[4]  = { 'W', 'S', 'C', 1 };
+
+bool MyMesh::isSyncMessageCode(uint8_t code) {
+  return code == RESP_CODE_CONTACT_MSG_RECV || code == RESP_CODE_CONTACT_MSG_RECV_V3 ||
+         code == RESP_CODE_CHANNEL_MSG_RECV || code == RESP_CODE_CHANNEL_MSG_RECV_V3;
+}
+
+void MyMesh::markSyncLogDirty() {
+  unsigned long now = millis();
+  if (!_synchist_log_dirty) _synchist_log_first = now;
+  _synchist_log_dirty = true;
+  _synchist_log_due = now + SYNC_HIST_LOG_COALESCE_MS;
+}
+
+void MyMesh::markSyncCursorsDirty() {
+  unsigned long now = millis();
+  if (!_synchist_cur_dirty) _synchist_cur_first = now;
+  _synchist_cur_dirty = true;
+  _synchist_cur_due = now + SYNC_HIST_CUR_COALESCE_MS;
+}
+
+static size_t syncHistWriteRecord(File& f, const uint8_t* frame, uint8_t len, uint32_t seq) {
+  uint8_t hdr[5];
+  memcpy(hdr, &seq, 4);
+  hdr[4] = len;
+  size_t n = f.write(hdr, sizeof(hdr));
+  n += f.write(frame, len);
+  return n;
+}
+
+// Adopt a fully-written temp when the live file is missing (swap interrupted by a
+// power cut); drop a stale temp that sits beside an intact live file.
+static void syncHistRecoverSwap(DataStore* store, FILESYSTEM* fs, const char* live, const char* tmp) {
+  if (!store->fileExists(fs, tmp)) return;
+  if (!store->fileExists(fs, live)) store->renameFile(fs, tmp, live);
+  else                              store->removeRooted(fs, tmp);
+}
+
+void MyMesh::loadSyncHistory() {
+  FILESYSTEM* fs = _store->getHotDataFS();
+  syncHistRecoverSwap(_store, fs, SYNC_HIST_LOG_FILE, SYNC_HIST_LOG_TMP);
+  syncHistRecoverSwap(_store, fs, SYNC_HIST_CUR_FILE, SYNC_HIST_CUR_TMP);
+
+  uint32_t last_seq = 0;
+  bool any = false;
+  File f = _store->openRead(fs, SYNC_HIST_LOG_FILE);
+  if (f) {
+    uint8_t magic[4];
+    if (f.read(magic, 4) == 4 && memcmp(magic, kSyncHistMagic, 4) == 0) {
+      size_t pos = 4, size = f.size();
+      while (pos + 5 <= size) {
+        uint8_t hdr[5];
+        if (f.read(hdr, 5) != 5) { _synchist_need_compact = true; break; }
+        uint32_t seq; memcpy(&seq, hdr, 4);
+        uint8_t len = hdr[4];
+        if (len == 0 || len > MAX_FRAME_SIZE || pos + 5 + len > size) { _synchist_need_compact = true; break; }  // torn tail
+        uint8_t buf[MAX_FRAME_SIZE];
+        if (f.read(buf, len) != len) { _synchist_need_compact = true; break; }
+        pos += 5 + len;
+        _synchist_file_recs++;
+        if ((any && seq <= last_seq) || !isSyncMessageCode(buf[0])) { _synchist_need_compact = true; continue; }
+        HistoryEntry& e = history_ring[history_head];
+        e.len = len;
+        memcpy(e.buf, buf, len);
+        e.seq = seq;
+        history_head = (history_head + 1) % HISTORY_RING_SIZE;
+        if (history_count < HISTORY_RING_SIZE) history_count++;
+        last_seq = seq;
+        any = true;
+      }
+      if (pos != size) _synchist_need_compact = true;   // trailing partial record
+    } else {
+      _synchist_need_compact = true;   // foreign / corrupt header: rewrite from RAM on the next flush
+    }
+    f.close();
+  }
+  if (any) history_next_seq = last_seq + 1;
+  if (_synchist_file_recs > 2u * HISTORY_RING_SIZE) _synchist_need_compact = true;
+  _synchist_unflushed = 0;
+
+  File c = _store->openRead(fs, SYNC_HIST_CUR_FILE);
+  if (c) {
+    uint8_t magic[4];
+    uint32_t next_seq = 0;
+    uint8_t n = 0;
+    if (c.read(magic, 4) == 4 && memcmp(magic, kSyncCurMagic, 4) == 0 &&
+        c.read((uint8_t*)&next_seq, 4) == 4 && c.read(&n, 1) == 1) {
+      if (next_seq > history_next_seq) history_next_seq = next_seq;
+      if (n > MAX_HISTORY_CLIENTS) n = MAX_HISTORY_CLIENTS;
+      for (uint8_t i = 0; i < n; i++) {
+        char id[MAX_CLIENT_ID_LEN + 1];
+        uint32_t last = 0;
+        if (c.read((uint8_t*)id, sizeof(id)) != sizeof(id) || c.read((uint8_t*)&last, 4) != 4) break;
+        id[MAX_CLIENT_ID_LEN] = '\0';
+        if (history_next_seq > 0 && last > history_next_seq - 1) last = history_next_seq - 1;  // never point past the ring
+        ClientHistoryState& st = history_clients[history_num_clients++];
+        strncpy(st.client_id, id, MAX_CLIENT_ID_LEN);
+        st.client_id[MAX_CLIENT_ID_LEN] = '\0';
+        st.last_delivered_seq = last;
+      }
+    }
+    c.close();
+  }
+  if (any || history_num_clients > 0) {
+    MESH_DEBUG_PRINTLN("sync history restored: %d msgs, %d clients, next_seq=%lu%s",
+                       history_count, history_num_clients, (unsigned long)history_next_seq,
+                       _synchist_need_compact ? " (log needs compaction)" : "");
+  }
+}
+
+bool MyMesh::appendSyncLog() {
+  int n = _synchist_unflushed;
+  if (n > history_count) n = history_count;
+  FILESYSTEM* fs = _store->getHotDataFS();
+  File f = _store->openAppend(fs, SYNC_HIST_LOG_FILE);
+  if (!f) return false;
+  bool ok = true;
+  if (f.size() == 0) ok = (f.write(kSyncHistMagic, 4) == 4);
+  int tail = (history_head - history_count + HISTORY_RING_SIZE) % HISTORY_RING_SIZE;
+  uint32_t recs = 0;
+  for (int i = history_count - n; ok && i < history_count; i++) {
+    const HistoryEntry& e = history_ring[(tail + i) % HISTORY_RING_SIZE];
+    if (!isSyncMessageCode(e.buf[0])) continue;
+    ok = (syncHistWriteRecord(f, e.buf, e.len, e.seq) == (size_t)(5 + e.len));
+    if (ok) recs++;
+  }
+  f.close();
+  if (!ok) {
+    _synchist_need_compact = true;   // a short append left a torn tail: rewrite next time
+    return false;
+  }
+  _synchist_file_recs += recs;
+  _synchist_unflushed = 0;
+  return true;
+}
+
+bool MyMesh::compactSyncLog() {
+  FILESYSTEM* fs = _store->getHotDataFS();
+  WdtHeavyGuard idle_wdt_guard;   // up to HISTORY_RING_SIZE x ~180 B in one go; SPIFFS may GC
+  File f = _store->openWrite(fs, SYNC_HIST_LOG_TMP);
+  if (!f) return false;
+  bool ok = (f.write(kSyncHistMagic, 4) == 4);
+  int tail = (history_head - history_count + HISTORY_RING_SIZE) % HISTORY_RING_SIZE;
+  uint32_t recs = 0;
+  for (int i = 0; ok && i < history_count; i++) {
+    const HistoryEntry& e = history_ring[(tail + i) % HISTORY_RING_SIZE];
+    if (!isSyncMessageCode(e.buf[0])) continue;
+    ok = (syncHistWriteRecord(f, e.buf, e.len, e.seq) == (size_t)(5 + e.len));
+    if (ok) recs++;
+  }
+  f.close();
+  if (!ok) { _store->removeRooted(fs, SYNC_HIST_LOG_TMP); return false; }   // keep the old log
+  _store->removeRooted(fs, SYNC_HIST_LOG_FILE);
+  if (!_store->renameFile(fs, SYNC_HIST_LOG_TMP, SYNC_HIST_LOG_FILE)) return false;  // loader adopts the tmp
+  _synchist_file_recs = recs;
+  _synchist_unflushed = 0;
+  _synchist_need_compact = false;
+  return true;
+}
+
+bool MyMesh::saveSyncCursors() {
+  FILESYSTEM* fs = _store->getHotDataFS();
+  File f = _store->openWrite(fs, SYNC_HIST_CUR_TMP);
+  if (!f) return false;
+  uint8_t n = (uint8_t)history_num_clients;
+  bool ok = (f.write(kSyncCurMagic, 4) == 4) &&
+            (f.write((const uint8_t*)&history_next_seq, 4) == 4) &&
+            (f.write(&n, 1) == 1);
+  for (int i = 0; ok && i < history_num_clients; i++) {
+    const ClientHistoryState& st = history_clients[i];
+    ok = (f.write((const uint8_t*)st.client_id, sizeof(st.client_id)) == sizeof(st.client_id)) &&
+         (f.write((const uint8_t*)&st.last_delivered_seq, 4) == 4);
+  }
+  f.close();
+  if (!ok) { _store->removeRooted(fs, SYNC_HIST_CUR_TMP); return false; }
+  _store->removeRooted(fs, SYNC_HIST_CUR_FILE);
+  return _store->renameFile(fs, SYNC_HIST_CUR_TMP, SYNC_HIST_CUR_FILE);
+}
+
+void MyMesh::serviceSyncHistory() {
+  unsigned long now = millis();
+  // An app disconnecting is the natural sync point: land its cursor right away so a
+  // power cut before the coalesce window closes cannot make it re-receive, on the
+  // next connect, the messages it just pulled.
+  bool connected = _serial && _serial->isConnected();
+  if (_synchist_was_connected && !connected && _synchist_cur_dirty) _synchist_cur_due = now;
+  _synchist_was_connected = connected;
+  if (_synchist_log_dirty &&
+      (millisHasNowPassed(_synchist_log_due) || now - _synchist_log_first >= SYNC_HIST_LOG_MAX_LATENCY_MS)) {
+    bool ok = (_synchist_need_compact || _synchist_file_recs > 2u * HISTORY_RING_SIZE)
+                ? compactSyncLog() : appendSyncLog();
+    if (ok) _synchist_log_dirty = false;
+    else    _synchist_log_due = now + SYNC_HIST_RETRY_MS;   // card missing / write failed: keep in RAM, retry later
+  }
+  if (_synchist_cur_dirty &&
+      (millisHasNowPassed(_synchist_cur_due) || now - _synchist_cur_first >= SYNC_HIST_CUR_MAX_LATENCY_MS)) {
+    if (saveSyncCursors()) _synchist_cur_dirty = false;
+    else                   _synchist_cur_due = now + SYNC_HIST_RETRY_MS;
+  }
+}
+
+void MyMesh::persistSyncHistoryNow() {
+  if (_synchist_log_dirty) {
+    bool ok = (_synchist_need_compact || _synchist_file_recs > 2u * HISTORY_RING_SIZE)
+                ? compactSyncLog() : appendSyncLog();
+    if (ok) _synchist_log_dirty = false;
+  }
+  if (_synchist_cur_dirty && saveSyncCursors()) _synchist_cur_dirty = false;
 }
 
 static bool clientIdEqual(const char* a, const char* b) {
@@ -1180,6 +1616,7 @@ int MyMesh::getNextFromHistoryForClient(const char* client_id, uint8_t frame[], 
     history_clients[slot].client_id[MAX_CLIENT_ID_LEN] = '\0';
     history_clients[slot].last_delivered_seq = history_next_seq > (uint32_t)history_count
       ? history_next_seq - (uint32_t)history_count : 0;
+    markSyncCursorsDirty();
   }
 
   uint32_t last = history_clients[slot].last_delivered_seq;
@@ -1214,8 +1651,10 @@ void MyMesh::commitHistoryForClient(const char* client_id, uint32_t seq) {
   const char* cid = (client_id && client_id[0]) ? client_id : "";
   for (int i = 0; i < history_num_clients; i++) {
     if (clientIdEqual(history_clients[i].client_id, cid)) {
-      if (seq > history_clients[i].last_delivered_seq)
+      if (seq > history_clients[i].last_delivered_seq) {
         history_clients[i].last_delivered_seq = seq;
+        markSyncCursorsDirty();
+      }
       return;
     }
   }
@@ -1225,8 +1664,10 @@ void MyMesh::advanceHistoryClientsAfterV3Broadcast(uint32_t seq) {
   for (int i = 0; i < history_num_clients; i++) {
     if (!shouldAdvanceClientAfterV3Broadcast(history_clients[i].client_id))
       continue;
-    if (seq > history_clients[i].last_delivered_seq)
+    if (seq > history_clients[i].last_delivered_seq) {
       history_clients[i].last_delivered_seq = seq;
+      markSyncCursorsDirty();
+    }
   }
 }
 
@@ -1388,7 +1829,501 @@ static inline bool isMsgFloodType(uint8_t t) {
   return t == PAYLOAD_TYPE_TXT_MSG || t == PAYLOAD_TYPE_GRP_TXT;
 }
 
+uint8_t MyMesh::companionDetachQueuedText(mesh::Packet* packets[], uint8_t priorities[],
+                                          uint32_t scheduled_for[]) {
+  uint8_t count = 0;
+  int queue_idx = 0;
+  const uint32_t now = _ms->getMillis();
+  while (queue_idx < _mgr->getOutboundTotal()
+         && count < COMPANION_TEXT_QUEUE_CAPACITY) {
+    mesh::Packet* packet = _mgr->getOutboundByIdx(queue_idx);
+    if (!packet || packet->getPayloadType() != PAYLOAD_TYPE_TXT_MSG) {
+      queue_idx++;
+      continue;
+    }
+
+    packet = _mgr->removeOutboundByIdx(queue_idx);
+    if (!packet) continue;
+
+    packets[count] = packet;
+    priorities[count] = packet->isRouteDirect() ? 0 : 1;
+    scheduled_for[count] = now;
+    for (int i = 0; i < COMPANION_RETRY_SLOTS; i++) {
+      const CompanionRetrySlot& slot = _companion_retries[i];
+      if (slot.active && slot.queued_packet == packet) {
+        priorities[count] = slot.priority;
+        scheduled_for[count] = slot.retry_at;
+        break;
+      }
+    }
+    count++;
+  }
+  return count;
+}
+
+bool MyMesh::companionRestoreQueuedText(mesh::Packet* packets[], const uint8_t priorities[],
+                                        const uint32_t scheduled_for[], uint8_t count) {
+  bool restored_all = true;
+  for (uint8_t i = 0; i < count; i++) {
+    mesh::Packet* packet = packets[i];
+    if (!packet) continue;
+
+    _mgr->queueOutbound(packet, priorities[i], scheduled_for[i]);
+    bool found = false;
+    for (int j = 0; j < _mgr->getOutboundTotal(); j++) {
+      if (_mgr->getOutboundByIdx(j) == packet) {
+        found = true;
+        break;
+      }
+    }
+    if (found) continue;
+
+    // queueOutbound() returned a rejected packet to the pool. Retire any
+    // retry metadata that still referred to that pool object.
+    restored_all = false;
+    for (int j = 0; j < COMPANION_RETRY_SLOTS; j++) {
+      if (_companion_retries[j].active
+          && _companion_retries[j].queued_packet == packet) {
+        companionRetryResetSlot(j);
+      }
+    }
+  }
+  return restored_all;
+}
+
+mesh::Packet* MyMesh::companionDetachQueuedTextByHash4(
+    uint32_t packet_hash4, uint8_t retry_key[MAX_HASH_SIZE]) {
+  for (int i = 0; i < _mgr->getOutboundTotal(); i++) {
+    mesh::Packet* packet = _mgr->getOutboundByIdx(i);
+    if (!packet || packet->getPayloadType() != PAYLOAD_TYPE_TXT_MSG) continue;
+
+    uint8_t candidate_key[MAX_HASH_SIZE];
+    uint32_t candidate_hash4 = 0;
+    packet->calculatePacketHash(candidate_key);
+    memcpy(&candidate_hash4, candidate_key, sizeof(candidate_hash4));
+    if (candidate_hash4 != packet_hash4) continue;
+
+    memcpy(retry_key, candidate_key, MAX_HASH_SIZE);
+    return _mgr->removeOutboundByIdx(i);
+  }
+  return nullptr;
+}
+
+int MyMesh::sendMessage(const ContactInfo& recipient, uint32_t timestamp, uint8_t attempt,
+                        const char* text, uint32_t& expected_ack, uint32_t& est_timeout,
+                        uint32_t* out_packet_hash4, TxtTxDebugInfo* out_dbg) {
+  if (!text) {
+    expected_ack = 0;
+    est_timeout = 0;
+    return MSG_SEND_FAILED;
+  }
+
+  mesh::Packet* held[COMPANION_TEXT_QUEUE_CAPACITY] = {};
+  uint8_t held_priorities[COMPANION_TEXT_QUEUE_CAPACITY] = {};
+  uint32_t held_schedules[COMPANION_TEXT_QUEUE_CAPACITY] = {};
+  const uint8_t held_count = companionDetachQueuedText(
+      held, held_priorities, held_schedules);
+
+  _last_plain_tx_meta_valid = false;
+  uint32_t packet_hash4 = 0;
+  int result = BaseChatMesh::sendMessage(recipient, timestamp, attempt, text,
+                                         expected_ack, est_timeout,
+                                         &packet_hash4, out_dbg);
+
+  uint8_t retry_key[MAX_HASH_SIZE] = {};
+  mesh::Packet* newest = result == MSG_SEND_FAILED
+      ? nullptr
+      : companionDetachQueuedTextByHash4(packet_hash4, retry_key);
+
+  const bool restored_old = companionRestoreQueuedText(
+      held, held_priorities, held_schedules, held_count);
+  bool restored_new = newest != nullptr;
+  if (newest) {
+    mesh::Packet* one[] = {newest};
+    const uint8_t priority[] = {static_cast<uint8_t>(newest->isRouteDirect() ? 0 : 1)};
+    const uint32_t scheduled[] = {_ms->getMillis()};
+    restored_new = companionRestoreQueuedText(one, priority, scheduled, 1);
+  }
+
+  if (!restored_old) {
+    MESH_DEBUG_PRINTLN("%s MyMesh::sendMessage(): failed to restore queued TXT", getLogDateTime());
+  }
+  if (result != MSG_SEND_FAILED && !restored_new) {
+    expected_ack = 0;
+    est_timeout = 0;
+    result = MSG_SEND_FAILED;
+  }
+
+  if (out_packet_hash4) *out_packet_hash4 = packet_hash4;
+  if (result != MSG_SEND_FAILED) {
+    _last_plain_tx_ack = expected_ack;
+    memcpy(_last_plain_tx_retry_key, retry_key, sizeof(_last_plain_tx_retry_key));
+    mesh::Utils::sha256(_last_plain_tx_fingerprint,
+                        sizeof(_last_plain_tx_fingerprint),
+                        recipient.id.pub_key, PUB_KEY_SIZE,
+                        reinterpret_cast<const uint8_t*>(text), strlen(text));
+    _last_plain_tx_meta_valid = true;
+  }
+  return result;
+}
+
+int MyMesh::sendCommandData(const ContactInfo& recipient, uint32_t timestamp,
+                            uint8_t attempt, const char* text, uint32_t& est_timeout,
+                            uint32_t* out_packet_hash4, TxtTxDebugInfo* out_dbg) {
+  if (!text) {
+    est_timeout = 0;
+    return MSG_SEND_FAILED;
+  }
+
+  mesh::Packet* held[COMPANION_TEXT_QUEUE_CAPACITY] = {};
+  uint8_t held_priorities[COMPANION_TEXT_QUEUE_CAPACITY] = {};
+  uint32_t held_schedules[COMPANION_TEXT_QUEUE_CAPACITY] = {};
+  const uint8_t held_count = companionDetachQueuedText(
+      held, held_priorities, held_schedules);
+
+  _last_plain_tx_meta_valid = false;
+  uint32_t packet_hash4 = 0;
+  int result = BaseChatMesh::sendCommandData(recipient, timestamp, attempt, text,
+                                             est_timeout, &packet_hash4, out_dbg);
+
+  uint8_t retry_key[MAX_HASH_SIZE] = {};
+  mesh::Packet* newest = result == MSG_SEND_FAILED
+      ? nullptr
+      : companionDetachQueuedTextByHash4(packet_hash4, retry_key);
+
+  const bool restored_old = companionRestoreQueuedText(
+      held, held_priorities, held_schedules, held_count);
+  bool restored_new = newest != nullptr;
+  if (newest) {
+    mesh::Packet* one[] = {newest};
+    const uint8_t priority[] = {static_cast<uint8_t>(newest->isRouteDirect() ? 0 : 1)};
+    const uint32_t scheduled[] = {_ms->getMillis()};
+    restored_new = companionRestoreQueuedText(one, priority, scheduled, 1);
+  }
+
+  if (!restored_old) {
+    MESH_DEBUG_PRINTLN("%s MyMesh::sendCommandData(): failed to restore queued TXT", getLogDateTime());
+  }
+  if (result != MSG_SEND_FAILED && !restored_new) {
+    est_timeout = 0;
+    result = MSG_SEND_FAILED;
+  }
+  if (out_packet_hash4) *out_packet_hash4 = packet_hash4;
+  return result;
+}
+
+uint32_t MyMesh::companionRetryDelay(const mesh::Packet* packet, bool direct,
+                                     uint8_t attempt_idx) {
+  if (!packet || !_radio) return 0;
+
+  const uint32_t packet_airtime = _radio->getEstAirtimeFor(packet->getRawLength());
+  if (direct) {
+    return CompanionRetryPolicy::directDelay(packet_airtime, attempt_idx);
+  }
+
+  const uint32_t max_packet_airtime = _radio->getEstAirtimeFor(MAX_TRANS_UNIT);
+  const uint32_t jitter_percent = getRNG()->nextInt(0, 201);
+  return CompanionRetryPolicy::floodDelay(max_packet_airtime, packet_airtime,
+                                           jitter_percent);
+}
+
+void MyMesh::companionRetryResetSlot(int slot_idx) {
+  if (slot_idx < 0 || slot_idx >= COMPANION_RETRY_SLOTS) return;
+
+  CompanionRetrySlot& slot = _companion_retries[slot_idx];
+  if (slot.active && _active_companion_retries > 0) {
+    _active_companion_retries--;
+  }
+  slot.queued_packet = nullptr;
+  slot.retry_at = 0;
+  slot.retry_delay = 0;
+  slot.missing_since = 0;
+  memset(slot.retry_key, 0, sizeof(slot.retry_key));
+  slot.attempts_sent = 0;
+  slot.max_attempts = 0;
+  slot.priority = 0;
+  slot.progress_marker = 0;
+  slot.payload_type = 0;
+  slot.direct = false;
+  slot.waiting_final_echo = false;
+  slot.active = false;
+}
+
+void MyMesh::companionRetryCancelSlot(int slot_idx) {
+  if (slot_idx < 0 || slot_idx >= COMPANION_RETRY_SLOTS) return;
+
+  CompanionRetrySlot& slot = _companion_retries[slot_idx];
+  mesh::Packet* queued = slot.queued_packet;
+  if (slot.active && queued) {
+    for (int i = 0; i < _mgr->getOutboundTotal(); i++) {
+      if (_mgr->getOutboundByIdx(i) != queued) continue;
+
+      uint8_t queued_key[MAX_HASH_SIZE];
+      queued->calculatePacketHash(queued_key);
+      if (memcmp(queued_key, slot.retry_key, sizeof(queued_key)) == 0) {
+        mesh::Packet* removed = _mgr->removeOutboundByIdx(i);
+        if (removed) releasePacket(removed);
+      }
+      break;
+    }
+  }
+  companionRetryResetSlot(slot_idx);
+}
+
+void MyMesh::companionRetryCancelKey(const uint8_t retry_key[MAX_HASH_SIZE]) {
+  if (!CompanionRetryPolicy::keyIsSet(retry_key, MAX_HASH_SIZE)) return;
+
+  // First retire tracked retry trains. companionRetryCancelSlot() also removes
+  // their queued clone when it has not entered the radio yet.
+  for (int i = 0; i < COMPANION_RETRY_SLOTS; i++) {
+    const CompanionRetrySlot& slot = _companion_retries[i];
+    if (slot.active && CompanionRetryPolicy::keysEqual(
+            slot.retry_key, retry_key, MAX_HASH_SIZE)) {
+      companionRetryCancelSlot(i);
+    }
+  }
+
+  // A semantic replacement can arrive before the original packet's first TX,
+  // before a CompanionRetrySlot exists. Remove that exact queued packet too.
+  for (int i = _mgr->getOutboundTotal() - 1; i >= 0; i--) {
+    mesh::Packet* packet = _mgr->getOutboundByIdx(i);
+    if (!packet || packet->getPayloadType() != PAYLOAD_TYPE_TXT_MSG) continue;
+
+    uint8_t queued_key[MAX_HASH_SIZE];
+    packet->calculatePacketHash(queued_key);
+    if (!CompanionRetryPolicy::keysEqual(
+            queued_key, retry_key, MAX_HASH_SIZE)) continue;
+
+    mesh::Packet* removed = _mgr->removeOutboundByIdx(i);
+    if (removed) releasePacket(removed);
+  }
+}
+
+bool MyMesh::companionRetryQueueClone(int slot_idx, const mesh::Packet* packet,
+                                      uint8_t attempt_idx) {
+  if (slot_idx < 0 || slot_idx >= COMPANION_RETRY_SLOTS || !packet) return false;
+
+  CompanionRetrySlot& slot = _companion_retries[slot_idx];
+  mesh::Packet* retry = obtainNewPacket();
+  if (!retry) return false;
+
+  *retry = *packet;  // exact duplicate: timestamp and ciphertext stay fixed
+  slot.retry_delay = companionRetryDelay(packet, slot.direct, attempt_idx);
+  slot.retry_at = _ms->getMillis() + slot.retry_delay;
+  _mgr->queueOutbound(retry, slot.priority, slot.retry_at);
+
+  for (int i = 0; i < _mgr->getOutboundTotal(); i++) {
+    if (_mgr->getOutboundByIdx(i) == retry) {
+      slot.queued_packet = retry;
+      slot.missing_since = 0;
+      return true;
+    }
+  }
+
+  // StaticPoolPacketManager already returned a rejected packet to its pool.
+  return false;
+}
+
+void MyMesh::companionRetryStart(const mesh::Packet* packet,
+                                 const uint8_t retry_key[MAX_HASH_SIZE]) {
+  if (!_companion_retry_enabled) return;   // Radio & Mesh toggle (opt-in, default OFF) — no train, no retries
+  if (!packet || !retry_key) return;
+
+  const uint8_t payload_type = packet->getPayloadType();
+  const uint8_t path_count = packet->getPathHashCount();
+  const bool text_from_self = packet->payload_len >= 2U * PATH_HASH_SIZE
+      && self_id.isHashMatch(&packet->payload[PATH_HASH_SIZE], PATH_HASH_SIZE);
+
+  bool direct = false;
+  uint8_t max_attempts = 0;
+  uint8_t priority = 0;
+  if (packet->isRouteDirect() && payload_type == PAYLOAD_TYPE_TXT_MSG
+      && path_count > 0 && text_from_self) {
+    direct = true;
+    max_attempts = CompanionRetryPolicy::DIRECT_MAX_ATTEMPTS;
+  } else if (packet->isRouteFlood() && path_count == 0
+             && ((payload_type == PAYLOAD_TYPE_TXT_MSG && text_from_self)
+                 || payload_type == PAYLOAD_TYPE_GRP_TXT)) {
+    max_attempts = CompanionRetryPolicy::FLOOD_MAX_ATTEMPTS;
+    priority = 1;
+  } else {
+    return;
+  }
+
+  for (int i = 0; i < COMPANION_RETRY_SLOTS; i++) {
+    const CompanionRetrySlot& slot = _companion_retries[i];
+    if (slot.active && slot.direct == direct
+        && memcmp(slot.retry_key, retry_key, MAX_HASH_SIZE) == 0) {
+      return;
+    }
+  }
+
+  int slot_idx = -1;
+  for (int i = 0; i < COMPANION_RETRY_SLOTS; i++) {
+    if (!_companion_retries[i].active) {
+      slot_idx = i;
+      break;
+    }
+  }
+  if (slot_idx < 0) return;
+
+  CompanionRetrySlot& slot = _companion_retries[slot_idx];
+  slot.queued_packet = nullptr;
+  slot.missing_since = 0;
+  memcpy(slot.retry_key, retry_key, MAX_HASH_SIZE);
+  slot.attempts_sent = 0;
+  slot.max_attempts = max_attempts;
+  slot.priority = priority;
+  slot.progress_marker = path_count;
+  slot.payload_type = payload_type;
+  slot.direct = direct;
+  slot.waiting_final_echo = false;
+  slot.active = true;
+  _active_companion_retries++;
+  if (!companionRetryQueueClone(slot_idx, packet, 0)) {
+    companionRetryResetSlot(slot_idx);
+  }
+}
+
+void MyMesh::logTx(mesh::Packet* packet, int len) {
+  (void)len;
+  if (!packet) return;
+
+  uint8_t packet_key[MAX_HASH_SIZE];
+  packet->calculatePacketHash(packet_key);
+
+  for (int i = 0; i < COMPANION_RETRY_SLOTS; i++) {
+    CompanionRetrySlot& slot = _companion_retries[i];
+    if (!slot.active || slot.queued_packet != packet) continue;
+
+    // If a pool object was unexpectedly reused, do not mistake the new packet
+    // for this retry.
+    if (memcmp(slot.retry_key, packet_key, MAX_HASH_SIZE) != 0) {
+      companionRetryResetSlot(i);
+      break;
+    }
+
+    slot.queued_packet = nullptr;
+    slot.missing_since = 0;
+    slot.attempts_sent++;
+    if (slot.attempts_sent >= slot.max_attempts) {
+      // Keep the metadata for one last echo window. Dispatcher releases the
+      // just-transmitted pool packet after this hook returns.
+      slot.waiting_final_echo = true;
+      slot.retry_at = _ms->getMillis() + slot.retry_delay;
+    } else if (!companionRetryQueueClone(i, packet, slot.attempts_sent)) {
+      companionRetryResetSlot(i);
+    }
+    return;
+  }
+
+  companionRetryStart(packet, packet_key);
+}
+
+void MyMesh::logTxFail(mesh::Packet* packet, int len) {
+  (void)len;
+  if (!packet) return;
+
+  for (int i = 0; i < COMPANION_RETRY_SLOTS; i++) {
+    CompanionRetrySlot& slot = _companion_retries[i];
+    if (!slot.active || slot.queued_packet != packet) continue;
+
+    // Dispatcher owns and releases this in-flight packet after the hook.
+    slot.queued_packet = nullptr;
+    companionRetryResetSlot(i);
+    return;
+  }
+}
+
+void MyMesh::companionRetryObserveRaw(const uint8_t raw[], int len) {
+  if (_active_companion_retries == 0 || !raw || len <= 0) return;
+
+  const uint8_t payload_type = (raw[0] >> PH_TYPE_SHIFT) & PH_TYPE_MASK;
+  if (payload_type != PAYLOAD_TYPE_TXT_MSG && payload_type != PAYLOAD_TYPE_GRP_TXT) {
+    return;
+  }
+
+  mesh::Packet packet;
+  if (!tryParsePacket(&packet, raw, len)) return;
+
+  const bool direct = packet.isRouteDirect();
+  if ((!direct && !packet.isRouteFlood())
+      || (direct && payload_type != PAYLOAD_TYPE_TXT_MSG)) {
+    return;
+  }
+
+  uint8_t retry_key[MAX_HASH_SIZE];
+  packet.calculatePacketHash(retry_key);
+  const uint8_t received_path_count = packet.getPathHashCount();
+  for (int i = 0; i < COMPANION_RETRY_SLOTS; i++) {
+    const CompanionRetrySlot& slot = _companion_retries[i];
+    if (!slot.active || slot.direct != direct
+        || memcmp(slot.retry_key, retry_key, MAX_HASH_SIZE) != 0) {
+      continue;
+    }
+
+    const bool is_echo = direct
+        ? CompanionRetryPolicy::isDirectEcho(slot.progress_marker, received_path_count)
+        : CompanionRetryPolicy::isFloodEcho(slot.progress_marker, received_path_count);
+    if (is_echo) companionRetryCancelSlot(i);
+  }
+}
+
+void MyMesh::companionRetryService() {
+  if (_active_companion_retries == 0) return;
+
+  const uint32_t now = _ms->getMillis();
+  const uint32_t missing_grace = 1000UL
+      + (2UL * _radio->getEstAirtimeFor(MAX_TRANS_UNIT));
+  for (int i = 0; i < COMPANION_RETRY_SLOTS; i++) {
+    CompanionRetrySlot& slot = _companion_retries[i];
+    if (!slot.active) continue;
+
+    if (slot.waiting_final_echo) {
+      if (millisHasNowPassed(slot.retry_at)) companionRetryResetSlot(i);
+      continue;
+    }
+
+    if (slot.queued_packet) {
+      bool found = false;
+      bool hash_matches = false;
+      for (int j = 0; j < _mgr->getOutboundTotal(); j++) {
+        mesh::Packet* queued = _mgr->getOutboundByIdx(j);
+        if (queued != slot.queued_packet) continue;
+
+        uint8_t queued_key[MAX_HASH_SIZE];
+        queued->calculatePacketHash(queued_key);
+        found = true;
+        hash_matches = memcmp(queued_key, slot.retry_key, MAX_HASH_SIZE) == 0;
+        break;
+      }
+
+      if (found) {
+        if (!hash_matches) {
+          // The pool object was reused after another send removed our retry.
+          companionRetryResetSlot(i);
+        } else {
+          slot.missing_since = 0;
+        }
+      } else if (slot.missing_since == 0) {
+        // Usually this means Dispatcher moved the packet from the queue to the
+        // radio. Allow enough time for its normal TX-complete/fail callback.
+        slot.missing_since = now == 0 ? 1 : now;
+      } else if ((uint32_t)(now - slot.missing_since) > missing_grace) {
+        // The pool object is no longer ours, so only retire the metadata here.
+        companionRetryResetSlot(i);
+      }
+      continue;
+    }
+
+    // A non-final active slot always owns one queued or in-flight clone.
+    companionRetryResetSlot(i);
+  }
+}
+
 void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
+  companionRetryObserveRaw(raw, len);
+
   const int8_t   snr_q4 = (int8_t)(snr * 4.0f);
   const uint32_t now_ms = millis();
   // Parse route + path length (hop count). Header byte layout is
@@ -1396,11 +2331,36 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
   // with 4 transport-code bytes following iff route is a TRANSPORT_* one; the
   // next byte's low 6 bits are the path length. hops == 0 = heard DIRECTLY.
   uint8_t rt = 0, hops = 0;
+  // What the frame says about WHO sent it. Only an advert carries a real
+  // identity (its payload opens with the sender's 32-byte public key); the
+  // addressed types open with a one-byte destination hash then a one-byte
+  // source hash. Anything else is anonymous on the wire and stays that way
+  // here -- see UiRxRec::org_kind.
+  uint8_t org_kind = 0, org[4] = {0, 0, 0, 0};
   if (len > 0) {
     rt = raw[0] & 0x03;
     const bool xp = (rt == ROUTE_TYPE_TRANSPORT_FLOOD || rt == ROUTE_TYPE_TRANSPORT_DIRECT);
     const int  ps = 1 + (xp ? 4 : 0);
-    hops = (ps < len) ? (uint8_t)(raw[ps] & 0x3F) : 0;
+    // The path-length byte packs BOTH counts: low 6 bits = number of hops, top
+    // 2 bits = bytes per hop hash minus one (Packet::getPathHashSize). So the
+    // path occupies count * size bytes on the wire, not count -- assuming one
+    // byte each reads the payload at the wrong offset the moment a mesh uses
+    // wider hashes, and a mis-offset "public key" is worse than none.
+    const uint8_t plb = (ps < len) ? raw[ps] : 0;
+    hops = (uint8_t)(plb & 0x3F);
+    const int payload = ps + 1 + (int)hops * (int)(((plb >> 6) & 0x03) + 1);
+    switch ((raw[0] >> 2) & 0x0F) {
+      case PAYLOAD_TYPE_ADVERT:
+        if (payload + 32 <= len) { org_kind = 1; memcpy(org, &raw[payload], 4); }
+        break;
+      case PAYLOAD_TYPE_REQ:
+      case PAYLOAD_TYPE_RESPONSE:
+      case PAYLOAD_TYPE_TXT_MSG:
+      case PAYLOAD_TYPE_PATH:
+        if (payload + 2 <= len) { org_kind = 2; org[0] = raw[payload]; org[1] = raw[payload + 1]; }
+        break;
+      default: break;
+    }
   }
   // Live signal for the top-bar icon: ONLY from packets heard DIRECTLY (0-hop), so
   // the reading reflects a real direct-neighbour RF link, not the SNR of a repeater
@@ -1416,7 +2376,7 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
   if (len > 0) {
     uiRxLogPush(now_ms, (int8_t)rssi, snr_q4,
                 (uint8_t)((raw[0] >> 2) & 0x0F), rt, hops,
-                (uint8_t)(len > 255 ? 255 : len));
+                (uint8_t)(len > 255 ? 255 : len), org_kind, org);
   }
 #if defined(DISPLAY_CLASS)
   // Diagnostic: log EVERY received frame so we can prove what reaches the
@@ -1524,6 +2484,54 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
       _serial->writeFrameToAll(out_frame, i);
     }
   }
+}
+
+// ---- Advertised-position displacement (#399) --------------------------------
+// Broadcast a position that is near where you are without being where you live.
+// Applied ONLY to our own adverts: the map, the GPS page and anything local keep
+// the true fix, because the point is to tell other people less, not to lie to
+// yourself.
+//
+// The displacement is DERIVED FROM THE NODE IDENTITY, so it is the same offset
+// every time rather than a fresh random one per advert. That distinction is the
+// whole feature: re-rolling per advert would scatter points around the true
+// position, and anyone averaging a night of them would recover the centre
+// exactly. A fixed displacement instead looks like a node that simply sits
+// somewhere else, which is what a manually-set location already looks like.
+void MyMesh::advertPosition(double& lat, double& lon) const {
+#if defined(ESP32)
+  const uint16_t r = touchPrefsGetGpsFuzzM();
+  if (r == 0 || (lat == 0 && lon == 0)) return;
+  // Bearing and distance are derived from the public key AND the chosen radius,
+  // so each setting gets its own unrelated direction.
+  //
+  // Keying on the identity alone was a real weakness, spotted by jesshampshire
+  // on #399: the bearing was then the same at every radius, so switching from
+  // 100 m to 1 km moved the reported point further along the SAME ray from the
+  // true position. Anyone who saw both could intersect them and recover the
+  // exact location, which is precisely what this setting exists to prevent.
+  // Folding the radius in means changing it lands somewhere unrelated instead.
+  //
+  // Still deterministic rather than random per advert, which is the other half
+  // of the design: a fresh offset each time would scatter points around the true
+  // position and averaging a night of them would recover the centre.
+  uint32_t h = 2166136261u;                       // FNV-1a over the key + radius
+  for (int i = 0; i < PUB_KEY_SIZE; ++i) { h ^= self_id.pub_key[i]; h *= 16777619u; }
+  h ^= (uint32_t)r;         h *= 16777619u;
+  h ^= (uint32_t)(r >> 8);  h *= 16777619u;
+  const double bearing = ((double)(h & 0xFFFFu) / 65536.0) * 2.0 * 3.14159265358979;
+  // Distance kept in the upper half of the radius: an offset that can land near
+  // zero would sometimes publish a position barely displaced at all.
+  const double dist    = (0.5 + ((double)((h >> 16) & 0xFFFFu) / 131072.0)) * (double)r;
+  const double dlat    = (dist * cos(bearing)) / 111320.0;
+  double coslat = cos(lat * 3.14159265358979 / 180.0);
+  if (coslat < 0.01) coslat = 0.01;                             // near the poles
+  const double dlon    = (dist * sin(bearing)) / (111320.0 * coslat);
+  lat += dlat;
+  lon += dlon;
+#else
+  (void)lat; (void)lon;
+#endif
 }
 
 void MyMesh::uiExportBackup(Print& out, double node_lat, double node_lon) {
@@ -1750,8 +2758,44 @@ bool MyMesh::shouldOverwriteWhenFull() const {
   return (_prefs.autoadd_config & AUTO_ADD_OVERWRITE_OLDEST) != 0;
 }
 
+// Drained from loop(), one blob per tick and never faster than every 500 ms, so a
+// burst of evictions (a busy mesh against a full contact table is a steady stream
+// of them) cannot chain garbage-collection passes back to back. The guard is the
+// same one saveContacts uses: a GC pass here starves the idle task, and without it
+// the watchdog turns a stall into a reboot.
+void MyMesh::drainPendingBlobDeletes() {
+  if (_pending_del_n == 0) return;
+  uint32_t now = millis();
+  if (_next_pending_del_at != 0 && (int32_t)(now - _next_pending_del_at) < 0) return;
+  _next_pending_del_at = now + 500;
+
+  uint8_t key[PUB_KEY_SIZE];
+  memcpy(key, _pending_del[0], PUB_KEY_SIZE);
+  if (--_pending_del_n > 0) {
+    memmove(_pending_del[0], _pending_del[1], (size_t)_pending_del_n * PUB_KEY_SIZE);
+  }
+  WdtHeavyGuard _wdt;
+  _store->deleteBlobByKey(key, PUB_KEY_SIZE);
+}
+
 void MyMesh::onContactOverwrite(const uint8_t* pub_key) {
-    _store->deleteBlobByKey(pub_key, PUB_KEY_SIZE); // delete from storage
+  // QUEUE the blob delete, never do it here (#222). This runs from the
+  // advert-receive path when the contact table is full, and on a Heltec V4 the
+  // store is internal SPIFFS: an unlink can trigger garbage collection, and
+  // SPIFFS GC suspends the flash cache, which stalls BOTH cores. The device
+  // froze solid for the duration — Bluetooth and TCP dropped, the screen would
+  // not wake — every single time a new contact evicted the oldest, and it got
+  // worse the fuller the volume (reports at ~350, ~600 and ~2000 contacts).
+  // Draining from loop() instead keeps it out of packet handling and rate-caps
+  // it, so a burst of evictions cannot chain GC passes back to back.
+  if (_pending_del_n < PENDING_DEL_MAX) {
+    memcpy(_pending_del[_pending_del_n++], pub_key, PUB_KEY_SIZE);
+  } else {
+    // Overflow orphans the blob for good — no other path deletes it — so it is not the
+    // "harmless" case the first cut of this assumed. Count it so a device that is
+    // actually hitting the wall can say so instead of silently leaking flash.
+    if (_orphaned_blobs < 0xFFFF) _orphaned_blobs++;
+  }
   if (_serial->isConnected()) {
     out_frame[0] = PUSH_CODE_CONTACT_DELETED;
     memcpy(&out_frame[1], pub_key, PUB_KEY_SIZE);
@@ -1776,6 +2820,48 @@ void MyMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path
       _serial->writeFrameToAll(out_frame, 1 + PUB_KEY_SIZE);
     }
   }
+  // Add the accepted named advert to the session-local recent-heard cache.
+  // A monotonic sequence, not the remote advert timestamp or local RTC, defines
+  // order so an unset/adjusted clock cannot make a fresh node look stale.
+  if (path_len <= sizeof(AdvertPath::path) && (path_len == 0 || path)) {
+    const uint32_t recv_timestamp = getRTCClock()->getCurrentTime();
+#if defined(ESP32)
+    portENTER_CRITICAL(&advert_paths_mux);
+#endif
+    int found = -1, free_slot = -1, oldest_slot = 0;
+    uint32_t oldest_seq = UINT32_MAX;
+    for (int i = 0; i < ADVERT_PATH_TABLE_SIZE; i++) {
+      if (advert_paths[i].used &&
+          memcmp(advert_paths[i].pubkey_prefix, contact.id.pub_key,
+                 sizeof(AdvertPath::pubkey_prefix)) == 0) {
+        found = i;
+        break;
+      }
+      if (!advert_paths[i].used && free_slot < 0) free_slot = i;
+      if (advert_paths[i].used && advert_paths[i].recv_seq < oldest_seq) {
+        oldest_seq = advert_paths[i].recv_seq;
+        oldest_slot = i;
+      }
+    }
+    AdvertPath* p = &advert_paths[found >= 0 ? found : (free_slot >= 0 ? free_slot : oldest_slot)];
+    memcpy(p->pubkey_prefix, contact.id.pub_key, sizeof(p->pubkey_prefix));
+    // contact.name is from an over-the-air advert and may fill its 32-byte field
+    // with no NUL terminator; an unbounded strcpy would then run past p->name and
+    // corrupt the advert_paths table (garbled "Found"/recently-heard entries).
+    strncpy(p->name, contact.name, sizeof(p->name) - 1);
+    p->name[sizeof(p->name) - 1] = '\0';
+    p->recv_timestamp = recv_timestamp;
+    if (++advert_recv_seq == 0) ++advert_recv_seq;
+    p->recv_seq = advert_recv_seq;
+    p->type = contact.type;
+    p->used = true;
+    p->path_len = path_len;
+    if (path_len) memcpy(p->path, path, path_len);
+#if defined(ESP32)
+    portEXIT_CRITICAL(&advert_paths_mux);
+#endif
+  }
+
 #ifdef DISPLAY_CLASS
   // Notify the touch UI whether or not a companion app is connected. This used to
   // fire only in the standalone (else) branch, so a contact discovered while the
@@ -1790,46 +2876,39 @@ void MyMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path
   if (_ui) _ui->discoveredContact(contact, is_new, path_len);
 #endif
 
-  // add inbound-path to mem cache
-  if (path && path_len <= sizeof(AdvertPath::path)) {  // check path is valid
-    AdvertPath* p = advert_paths;
-    uint32_t oldest = 0xFFFFFFFF;
-    for (int i = 0; i < ADVERT_PATH_TABLE_SIZE; i++) {   // check if already in table, otherwise evict oldest
-      if (memcmp(advert_paths[i].pubkey_prefix, contact.id.pub_key, sizeof(AdvertPath::pubkey_prefix)) == 0) {
-        p = &advert_paths[i];   // found
-        break;
-      }
-      if (advert_paths[i].recv_timestamp < oldest) {
-        oldest = advert_paths[i].recv_timestamp;
-        p = &advert_paths[i];
-      }
-    }
-
-    memcpy(p->pubkey_prefix, contact.id.pub_key, sizeof(p->pubkey_prefix));
-    // contact.name is from an over-the-air advert and may fill its 32-byte field
-    // with no NUL terminator; an unbounded strcpy would then run past p->name and
-    // corrupt the advert_paths table (garbled "Found"/recently-heard entries).
-    strncpy(p->name, contact.name, sizeof(p->name) - 1);
-    p->name[sizeof(p->name) - 1] = '\0';
-    p->recv_timestamp = getRTCClock()->getCurrentTime();
-    p->path_len = path_len;
-    memcpy(p->path, path, p->path_len);
-  }
-
   if (!is_new) dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY); // only schedule lazy write for contacts that are in contacts[]
 }
 
 static int sort_by_recent(const void *a, const void *b) {
-  return ((AdvertPath *) b)->recv_timestamp - ((AdvertPath *) a)->recv_timestamp;
+  const RecentlyHeardName* x = static_cast<const RecentlyHeardName*>(a);
+  const RecentlyHeardName* y = static_cast<const RecentlyHeardName*>(b);
+  if (x->recv_seq == y->recv_seq) return memcmp(x->pubkey_prefix, y->pubkey_prefix, sizeof(x->pubkey_prefix));
+  return (int32_t)(x->recv_seq - y->recv_seq) > 0 ? -1 : 1;
 }
 
-int MyMesh::getRecentlyHeard(AdvertPath dest[], int max_num) {
-  if (max_num > ADVERT_PATH_TABLE_SIZE) max_num = ADVERT_PATH_TABLE_SIZE;
-  qsort(advert_paths, ADVERT_PATH_TABLE_SIZE, sizeof(advert_paths[0]), sort_by_recent);
-
-  for (int i = 0; i < max_num; i++) {
-    dest[i] = advert_paths[i];
+int MyMesh::getRecentlyHeard(RecentlyHeardName dest[], int max_num) {
+  if (!dest || max_num <= 0) return 0;
+  RecentlyHeardName snapshot[ADVERT_PATH_TABLE_SIZE];
+  int count = 0;
+#if defined(ESP32)
+  portENTER_CRITICAL(&advert_paths_mux);
+#endif
+  for (int i = 0; i < ADVERT_PATH_TABLE_SIZE; i++) {
+    const AdvertPath& p = advert_paths[i];
+    if (!p.used || !p.name[0]) continue;
+    RecentlyHeardName& out = snapshot[count++];
+    memcpy(out.pubkey_prefix, p.pubkey_prefix, sizeof(out.pubkey_prefix));
+    memcpy(out.name, p.name, sizeof(out.name));
+    out.name[sizeof(out.name) - 1] = '\0';
+    out.recv_seq = p.recv_seq;
+    out.type = p.type;
   }
+#if defined(ESP32)
+  portEXIT_CRITICAL(&advert_paths_mux);
+#endif
+  qsort(snapshot, count, sizeof(snapshot[0]), sort_by_recent);
+  if (max_num > count) max_num = count;
+  memcpy(dest, snapshot, (size_t)max_num * sizeof(dest[0]));
   return max_num;
 }
 
@@ -1839,6 +2918,74 @@ void MyMesh::onContactPathUpdated(const ContactInfo &contact) {
   _serial->writeFrameToAll(out_frame, 1 + PUB_KEY_SIZE); // NOTE: app may not be connected
 
   dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
+}
+
+void MyMesh::clearExpectedAck(AckTableEntry& entry, bool cancel_retry) {
+  if (cancel_retry) companionRetryCancelKey(entry.retry_key);
+  memset(&entry, 0, sizeof(entry));
+}
+
+MyMesh::AckTableEntry* MyMesh::findPendingTextMessage(
+    const uint8_t text_fingerprint[MAX_HASH_SIZE]) {
+  if (!text_fingerprint) return nullptr;
+  for (int i = 0; i < EXPECTED_ACK_TABLE_SIZE; i++) {
+    AckTableEntry& entry = expected_ack_table[i];
+    if (CompanionRetryPolicy::shouldReplacePendingText(
+            entry.ack, entry.text_fingerprint, text_fingerprint, MAX_HASH_SIZE)) {
+      return &entry;
+    }
+  }
+  return nullptr;
+}
+
+void MyMesh::uiRegisterExpectedAck(uint32_t expected_ack, const uint8_t pub_key[32]) {
+  if (expected_ack == 0 || !pub_key) return;
+
+  // Transport retries of the same command frame reuse the ACK. Do not create
+  // another table entry or disturb the packet's existing retry ownership.
+  for (int i = 0; i < EXPECTED_ACK_TABLE_SIZE; i++) {
+    if (expected_ack_table[i].ack == expected_ack) {
+      _last_plain_tx_meta_valid = false;
+      return;
+    }
+  }
+
+  ContactInfo* contact = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+  if (!contact) {
+    _last_plain_tx_meta_valid = false;
+    return;
+  }
+
+  const bool has_send_meta = _last_plain_tx_meta_valid
+      && _last_plain_tx_ack == expected_ack;
+  AckTableEntry* replacement = has_send_meta
+      ? findPendingTextMessage(_last_plain_tx_fingerprint)
+      : nullptr;
+
+  AckTableEntry* entry;
+  if (replacement) {
+    // Only the same recipient+text supersedes an older pending message.
+    // Unrelated messages retain both their ACK record and retry train.
+    clearExpectedAck(*replacement, true);
+    entry = replacement;
+  } else {
+    entry = &expected_ack_table[next_ack_idx];
+    // Circular-table eviction is bookkeeping only: do not cancel an unrelated
+    // message's lower-level retries merely because its ACK slot is reused.
+    clearExpectedAck(*entry, false);
+    next_ack_idx = (next_ack_idx + 1) % EXPECTED_ACK_TABLE_SIZE;
+  }
+
+  entry->msg_sent = _ms->getMillis();
+  entry->ack = expected_ack;
+  entry->contact = contact;
+  if (has_send_meta) {
+    memcpy(entry->text_fingerprint, _last_plain_tx_fingerprint,
+           sizeof(entry->text_fingerprint));
+    memcpy(entry->retry_key, _last_plain_tx_retry_key,
+           sizeof(entry->retry_key));
+  }
+  _last_plain_tx_meta_valid = false;
 }
 
 ContactInfo*  MyMesh::processAck(const uint8_t *data) {
@@ -1855,7 +3002,7 @@ ContactInfo*  MyMesh::processAck(const uint8_t *data) {
 #endif
   // see if matches any in a table
   for (int i = 0; i < EXPECTED_ACK_TABLE_SIZE; i++) {
-    if (memcmp(data, &expected_ack_table[i].ack, 4) == 0) { // got an ACK from recipient
+    if (CompanionRetryPolicy::ackMatches(expected_ack_table[i].ack, data)) {
       out_frame[0] = PUSH_CODE_SEND_CONFIRMED;
       memcpy(&out_frame[1], data, 4);
       uint32_t trip_time = _ms->getMillis() - expected_ack_table[i].msg_sent;
@@ -1871,9 +3018,11 @@ ContactInfo*  MyMesh::processAck(const uint8_t *data) {
       }
 #endif
 
-      // NOTE: the same ACK can be received multiple times!
-      expected_ack_table[i].ack = 0; // clear expected hash, now that we have received ACK
-      return expected_ack_table[i].contact;
+      // An ACK is stronger delivery evidence than a local repeater echo. Stop
+      // the exact retry train before clearing its bookkeeping entry.
+      ContactInfo* contact = expected_ack_table[i].contact;
+      clearExpectedAck(expected_ack_table[i], true);
+      return contact;
     }
   }
   return checkConnectionsAck(data);
@@ -2003,7 +3152,7 @@ static inline uint32_t txtFloodFp(mesh::Packet* pkt) {
 
 void MyMesh::sendFloodScoped(const TransportKey& scope, mesh::Packet* pkt, uint32_t delay_millis) {
   uiTrackSentFp(txtFloodFp(pkt));
-  uint8_t phs = (uint8_t)(_prefs.path_hash_mode + 1);
+  const uint8_t phs = floodPathHashSize();
   if (scope.isNull()) {
     sendFlood(pkt, delay_millis, phs);
   } else {
@@ -2025,7 +3174,7 @@ void MyMesh::sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, ui
   // is honoured here; otherwise unscoped. Channel/group floods keep default_scope
   // — see the GroupChannel overload below — so public-channel containment is intact.
   if (send_unscoped) {
-    sendFlood(pkt, delay_millis, _prefs.path_hash_mode + 1);
+    sendFlood(pkt, delay_millis, floodPathHashSize());
   } else if (!send_scope.isNull()) {
     sendFloodScoped(send_scope, pkt, delay_millis);   // explicit per-send override (app CMD_SET_FLOOD_SCOPE)
   } else if (scope_direct_floods) {
@@ -2037,14 +3186,14 @@ void MyMesh::sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, ui
     memcpy(&default_scope.key, _prefs.default_scope_key, sizeof(default_scope.key));
     sendFloodScoped(default_scope, pkt, delay_millis);
   } else {
-    sendFlood(pkt, delay_millis, _prefs.path_hash_mode + 1);   // default: unscoped (cross-region safe)
+    sendFlood(pkt, delay_millis, floodPathHashSize());   // default: unscoped (cross-region safe)
   }
 }
 void MyMesh::sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t delay_millis) {
   uiTrackSentFp(txtFloodFp(pkt));
   // TODO: have per-channel send_scope
   if (send_unscoped) {
-    sendFlood(pkt, delay_millis, _prefs.path_hash_mode + 1);  // app has explicitly requested un-scoped
+    sendFlood(pkt, delay_millis, floodPathHashSize());  // app has explicitly requested un-scoped
   } else {
     TransportKey default_scope;
     memcpy(&default_scope.key, _prefs.default_scope_key, sizeof(default_scope.key));
@@ -2080,6 +3229,27 @@ void MyMesh::onSignedMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uin
 #endif
 }
 
+int MyMesh::findConfiguredChannelIdx(const mesh::GroupChannel& ch) const {
+  for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+    ChannelDetails cd;
+    if (!const_cast<MyMesh*>(this)->getChannel(i, cd)) continue;
+    if (!channelSlotConfigured(cd)) continue;            // never match an empty slot
+    if (memcmp(ch.secret, cd.channel.secret, sizeof(ch.secret)) == 0) return i;
+  }
+  return -1;
+}
+
+int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel dest[], int max_matches) {
+  int n = 0;
+  for (int i = 0; i < MAX_GROUP_CHANNELS && n < max_matches; i++) {
+    ChannelDetails cd;
+    if (!getChannel(i, cd)) continue;
+    if (!channelSlotConfigured(cd)) continue;   // an all-zero slot is not a channel
+    if (cd.channel.hash[0] == hash[0]) dest[n++] = cd.channel;
+  }
+  return n;
+}
+
 void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint32_t timestamp,
                                   const char *text) {
   // Clock bootstrap from a channel peer's send-time (same sane-window + unset-only guard
@@ -2094,11 +3264,13 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
   out_frame[i++] = 0; // reserved1
   out_frame[i++] = 0; // reserved2
 
-  int channel_idx_i = findChannelIdx(channel);
-  if (channel_idx_i < 0 || channel_idx_i >= MAX_GROUP_CHANNELS) {
-    // Keep on-wire channel index stable for clients that assume 0..MAX_GROUP_CHANNELS-1.
-    channel_idx_i = 0;
-  }
+  // Configured slots only: an all-zero slot must never be reported as the
+  // channel a message arrived on (#260).
+  const int resolved_idx = findConfiguredChannelIdx(channel);
+  // Keep the on-wire index inside 0..MAX_GROUP_CHANNELS-1 for clients that
+  // assume it, but remember whether it was actually resolved — an unresolved
+  // channel must not borrow slot 0's identity on screen.
+  int channel_idx_i = (resolved_idx >= 0 && resolved_idx < MAX_GROUP_CHANNELS) ? resolved_idx : 0;
   uint8_t channel_idx = (uint8_t)channel_idx_i;
   out_frame[i++] = channel_idx;
   uint8_t path_len = out_frame[i++] = pkt->isRouteFlood() ? pkt->path_len : 0xFF;
@@ -2134,9 +3306,12 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
 #endif
 #ifdef DISPLAY_CLASS
   // Get the channel name from the channel index
-  const char *channel_name = "Unknown";
+  // Never hand the UI an empty name: it renders one as a "#unknown" thread, which
+  // is what users saw. Only a RESOLVED, configured, actually-named slot names the
+  // thread; anything else is honestly labelled instead of borrowing slot 0.
+  const char *channel_name = "Unknown channel";
   ChannelDetails channel_details;
-  if (getChannel(channel_idx, channel_details)) {
+  if (resolved_idx >= 0 && getChannel(channel_idx, channel_details) && channel_details.name[0]) {
     channel_name = channel_details.name;
   }
   /* notify BEFORE newMsgFromPub: UITask::newMsg keys on the last UIEventType
@@ -2185,8 +3360,32 @@ uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_tim
     if (permissions & TELEM_PERM_BASE) { // only respond if base permission bit is set
       telemetry.reset();
       telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)board.getBattMilliVolts() / 1000.0f);
-      // query other sensors -- target specific
+      // query other sensors -- target specific.
+      //
+      // Telemetry answers with a position too, and it has to honour the same
+      // displacement as adverts or the privacy setting is a hole rather than a
+      // feature: someone who turns it on would reasonably believe their exact
+      // position is not going out, while a telemetry request returned it
+      // (spotted by honza_87628). querySensors() reads these members directly,
+      // so displace them across the call and put the true values back straight
+      // after, which keeps the local map and GPS page accurate.
+      //
+      // v59: an answer is not a broadcast, so the operator can choose to give the
+      // contacts they already picked the true fix (honza_87628). Off by default,
+      // and the advert stays displaced either way.
+      const double telem_true_lat = sensors.node_lat;
+      const double telem_true_lon = sensors.node_lon;
+#if defined(ESP32) && defined(HAS_TOUCH_UI)
+      const bool telem_exact = touchPrefsGetTelemLocExact();
+#else
+      const bool telem_exact = false;   // no touch prefs here: keep the displacement
+#endif
+      if (!telem_exact) advertPosition(sensors.node_lat, sensors.node_lon);
       sensors.querySensors(permissions, telemetry);
+      if (!telem_exact) {
+        sensors.node_lat = telem_true_lat;
+        sensors.node_lon = telem_true_lon;
+      }
 
       memcpy(reply, &sender_timestamp,
              4); // reflect sender_timestamp back in response packet (kind of like a 'tag')
@@ -2200,6 +3399,7 @@ uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_tim
 }
 
 void MyMesh::onContactResponse(const ContactInfo &contact, const uint8_t *data, uint8_t len) {
+  if (!data || len < 4) return;
   uint32_t tag;
   memcpy(&tag, data, 4);
 
@@ -2223,6 +3423,8 @@ void MyMesh::onContactResponse(const ContactInfo &contact, const uint8_t *data, 
     if (kind == UiReqKind::Telemetry) {
       // CayenneLPP payload — let the UI decode the LPP channels.
       _ui->onTelemetryReply(contact, &data[4], (size_t)(len - 4));
+    } else if (kind == UiReqKind::Regions) {
+      _ui->onRegionListReply(contact, data, len);
     } else {
       // STATUS or unknown — let the UI fall through its RepeaterStats /
       // JSON parser path.
@@ -2241,14 +3443,30 @@ void MyMesh::onContactResponse(const ContactInfo &contact, const uint8_t *data, 
   if (_ui_login_then && len > 4 && memcmp(&_ui_login_then, contact.id.pub_key, 4) == 0) {
     const bool login_ok = (data[4] == RESP_SERVER_LOGIN_OK)
                           || (len > 5 && memcmp(&data[4], "OK", 2) == 0);
-    const UiReqKind k = _ui_login_then_kind;
-    cancelUIDeferredLogin();
-    if (login_ok) {
-      ContactInfo& rc = const_cast<ContactInfo&>(contact);
-      if (k == UiReqKind::Telemetry) sendTelemetryRequestForUI(rc);
-      else                           sendStatusPingForUI(rc);
+    // The comment above assumes ANY response arriving while armed must be our login reply.
+    // That holds for the UI, but the COMPANION APP can have its own STATUS / TELEMETRY /
+    // BINARY request in flight to this same node, and there is no distinct "login failed"
+    // code on the wire (a failure is merely "not RESP_SERVER_LOGIN_OK"), so a non-OK frame
+    // is indistinguishable from the app's reply. Swallowing it here ate the app's response
+    // and returned, leaving the phone waiting forever — a contributor to the "no ping or
+    // telemetry response, from the device AND the app" reports (#124).
+    // A LOGIN_OK is unambiguously ours, so always take it. Otherwise, if the app is waiting
+    // on this same contact, fall through and let its matcher have the frame; our own reply
+    // deadline still disarms us, which is all the early disarm here ever bought.
+    const bool app_waiting =
+        (pending_status    && memcmp(&pending_status,    contact.id.pub_key, 4) == 0) ||
+        (pending_telemetry && memcmp(&pending_telemetry, contact.id.pub_key, 4) == 0) ||
+        (pending_req       && memcmp(&pending_req,       contact.id.pub_key, 4) == 0);
+    if (login_ok || !app_waiting) {
+      const UiReqKind k = _ui_login_then_kind;
+      cancelUIDeferredLogin();
+      if (login_ok) {
+        ContactInfo& rc = const_cast<ContactInfo&>(contact);
+        if (k == UiReqKind::Telemetry) sendTelemetryRequestForUI(rc);
+        else                           sendStatusPingForUI(rc);
+      }
+      return;   // login frame consumed (OK fired the REQ; fail disarmed)
     }
-    return;   // login frame consumed (OK fired the REQ; fail disarmed)
   }
 #endif
 
@@ -2401,6 +3619,22 @@ void MyMesh::onControlDataRecv(mesh::Packet *packet) {
       _ui_sig_ms     = millis();
     }
   }
+  // Discover scan (Discover app): collect EVERY NODE_DISCOVER_RESP matching the active discover
+  // sweep tag into _discover[], keyed by responder pubkey. Additive to the single-scalar probe
+  // capture above (they use different tags). RESP payload (MeshCore docs/payloads.md):
+  //   [0]=0x9<<4|node_type  [1]=their SNR*4 (reverse link)  [2..5]=tag  [6..]=pubkey (8 or 32 bytes).
+  if (packet->payload_len >= 6 + 8 && (packet->payload[0] & 0xF0) == CTL_TYPE_NODE_DISCOVER_RESP
+      && _discover_tag != 0) {
+    uint32_t rtag; memcpy(&rtag, &packet->payload[2], 4);
+    if (rtag == _discover_tag) {
+      uint8_t node_type    = packet->payload[0] & 0x0F;
+      int8_t  their_snr_q4 = (int8_t)packet->payload[1];
+      uint8_t pklen        = (packet->payload_len >= 6 + 32) ? 32 : 8;
+      int8_t  our_snr_q4   = (int8_t)(packet->getSNR() * 4.0f);
+      int8_t  our_rssi     = (int8_t)_radio->getLastRSSI();
+      discoverUpsert(&packet->payload[6], pklen, node_type, our_snr_q4, our_rssi, their_snr_q4, packet->path_len);
+    }
+  }
   if (packet->payload_len + 4 > sizeof(out_frame)) {
     MESH_DEBUG_PRINTLN("onControlDataRecv(), payload_len too long: %d", packet->payload_len);
     return;
@@ -2418,6 +3652,38 @@ void MyMesh::onControlDataRecv(mesh::Packet *packet) {
   } else {
     MESH_DEBUG_PRINTLN("onControlDataRecv(), data received while app offline");
   }
+}
+
+// Upsert a discover responder into _discover[] (keyed by the 8-byte pubkey prefix). New nodes
+// append; a full table evicts the least-recently-heard. Both link directions + hop count are
+// refreshed on every reply. See DiscoverHit / uiStartDiscoverScan in MyMesh.h.
+void MyMesh::discoverUpsert(const uint8_t* pk, uint8_t pklen, uint8_t node_type,
+                            int8_t our_snr_q4, int8_t our_rssi, int8_t their_snr_q4, uint8_t path_len) {
+  uint32_t now = millis();
+  int slot = -1;
+  for (uint8_t i = 0; i < _discover_cnt; i++) {
+    if (memcmp(_discover[i].pubkey, pk, 8) == 0) { slot = i; break; }
+  }
+  if (slot < 0) {
+    if (_discover_cnt < DISCOVER_MAX) {
+      slot = _discover_cnt++;
+    } else {                                    // table full -> evict the least-recently-heard
+      uint32_t oldest = 0xFFFFFFFFu; slot = 0;
+      for (uint8_t i = 0; i < _discover_cnt; i++)
+        if (_discover[i].last_ms < oldest) { oldest = _discover[i].last_ms; slot = i; }
+    }
+    memset(&_discover[slot], 0, sizeof(DiscoverHit));
+    memcpy(_discover[slot].pubkey, pk, pklen > 32 ? 32 : pklen);
+    _discover[slot].first_ms = now;
+  }
+  DiscoverHit& h = _discover[slot];
+  h.node_type    = node_type;
+  h.our_snr_q4   = our_snr_q4;
+  h.our_rssi     = our_rssi;
+  h.their_snr_q4 = their_snr_q4;
+  h.path_len     = path_len;
+  h.last_ms      = now;
+  if (h.heard < 0xFFFF) h.heard++;
 }
 
 void MyMesh::onRawDataRecv(mesh::Packet *packet) {
@@ -2522,6 +3788,7 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   app_target_ver = 0;
   clearPendingReqs();
   _ui_pending_status = 0;
+  memset(expected_ack_table, 0, sizeof(expected_ack_table));
   next_ack_idx = 0;
   sign_data = NULL;
   dirty_contacts_expiry = 0;
@@ -2541,7 +3808,7 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   _prefs.gps_enabled = 0;       // GPS disabled by default
   _prefs.gps_interval = 0;      // No automatic GPS updates by default
   //_prefs.rx_delay_base = 10.0f;  enable once new algo fixed
-#if defined(USE_SX1262) || defined(USE_SX1268)
+#if defined(USE_SX1262) || defined(USE_SX1268) || defined(USE_LR1121)
 #ifdef SX126X_RX_BOOSTED_GAIN
   _prefs.rx_boosted_gain = SX126X_RX_BOOSTED_GAIN ? 1 : 0;
 #else
@@ -2557,7 +3824,7 @@ void MyMesh::applyRadioFromPrefs() {
   radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
   radio_driver.radioRelease();
   radio_driver.setTxPower(_prefs.tx_power_dbm);
-#if defined(USE_SX1262) || defined(USE_SX1268)
+#if defined(USE_SX1262) || defined(USE_SX1268) || defined(USE_LR1121)
   _prefs.rx_boosted_gain = _prefs.rx_boosted_gain ? 1 : 0;
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain != 0);
   MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
@@ -2664,6 +3931,15 @@ void MyMesh::begin(bool has_display) {
     _prefs.autoadd_max_hops = 64;
   }
 
+  // #271: bring up the region registry and seed it from what this node is
+  // already configured for, so scope naming works out of the box with no list to
+  // fill in first. Our own default region is the one we can always name; the UI
+  // adds any per-channel scope overrides once those prefs are readable.
+  // ensureRegion() is idempotent, so re-running this every boot is a no-op after
+  // the first, and a slot once assigned is never renumbered.
+  _region_reg.begin(_store->getPrimaryFS());
+  if (_prefs.default_scope_name[0]) _region_reg.ensureRegion(_prefs.default_scope_name);
+
 #ifdef BLE_PIN_CODE // 123456 by default
   if (_prefs.ble_pin == 0) {
 #ifdef DISPLAY_CLASS
@@ -2693,6 +3969,7 @@ void MyMesh::begin(bool has_display) {
   bootstrapRTCfromContacts();
   addChannel("Public", PUBLIC_GROUP_PSK); // pre-configure Andy's public channel
   _store->loadChannels(this);
+  loadSyncHistory();   // app-sync replay ring + client cursors survive a reboot/power cut
 
   applyRadioFromPrefs();   // freq/bw/sf/cr + TX power + RX-boost (shared with the live UI apply)
 #if defined(DISPLAY_CLASS)
@@ -2954,7 +4231,6 @@ void MyMesh::handleCmdFrame(size_t len) {
           _ui->appendDiag(line);
         }
       }
-      // TODO: add expected ACK to table
       if (result == MSG_SEND_FAILED) {
         writeErrFrame(ERR_CODE_TABLE_FULL);
       } else {
@@ -2963,10 +4239,7 @@ void MyMesh::handleCmdFrame(size_t len) {
           s_last_cmd_txt_est_timeout = est_timeout;
         }
         if (expected_ack) {
-          expected_ack_table[next_ack_idx].msg_sent = _ms->getMillis(); // add to circular table
-          expected_ack_table[next_ack_idx].ack = expected_ack;
-          expected_ack_table[next_ack_idx].contact = recipient;
-          next_ack_idx = (next_ack_idx + 1) % EXPECTED_ACK_TABLE_SIZE;
+          uiRegisterExpectedAck(expected_ack, recipient->id.pub_key);
         }
 
         out_frame[0] = RESP_CODE_SENT;
@@ -3001,7 +4274,13 @@ void MyMesh::handleCmdFrame(size_t len) {
       writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
     } else {
       ChannelDetails channel;
-      bool success = getChannel(channel_idx, channel);
+      // getChannel() succeeds for ANY in-range index, including a slot that was
+      // never configured — whose secret is all zeroes. Transmitting on one sends
+      // a group message encrypted with an all-zero key, which every OTHER device
+      // then decrypts against its own spare empty slot and files under a nameless
+      // "#unknown" thread (#260). An app whose channel list is out of step with
+      // the device's slots must get an error, not a broadcast nobody can attribute.
+      bool success = getChannel(channel_idx, channel) && channelSlotConfigured(channel);
       if (success && sendGroupMessage(msg_timestamp, channel.channel, _prefs.node_name, text, len - i)) {
         writeOKFrame();
         // Mirror the app-sent channel message into the on-device touch UI — the channel-send path
@@ -3126,7 +4405,9 @@ void MyMesh::handleCmdFrame(size_t len) {
     if (_prefs.advert_loc_policy == ADVERT_LOC_NONE) {
       pkt = createSelfAdvert(_prefs.node_name);
     } else {
-      pkt = createSelfAdvert(_prefs.node_name, sensors.node_lat, sensors.node_lon);
+      { double alat = sensors.node_lat, alon = sensors.node_lon;
+        advertPosition(alat, alon);
+        pkt = createSelfAdvert(_prefs.node_name, alat, alon); }
     }
     if (pkt) {
       if (len >= 2 && cmd_frame[1] == 1) { // optional param (1 = flood, 0 = zero hop)
@@ -3219,7 +4500,9 @@ void MyMesh::handleCmdFrame(size_t len) {
       if (_prefs.advert_loc_policy == ADVERT_LOC_NONE) {
         pkt = createSelfAdvert(_prefs.node_name);
       } else {
-        pkt = createSelfAdvert(_prefs.node_name, sensors.node_lat, sensors.node_lon);
+        { double alat = sensors.node_lat, alon = sensors.node_lon;
+        advertPosition(alat, alon);
+        pkt = createSelfAdvert(_prefs.node_name, alat, alon); }
       }
       if (pkt) {
         pkt->header |= ROUTE_TYPE_FLOOD; // would normally be sent in this mode
@@ -3356,7 +4639,7 @@ void MyMesh::handleCmdFrame(size_t len) {
 
       radio_driver.radioAcquire();   // hold off the RX drain task mid-sequence (no-op when off)
       radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
-#if defined(USE_SX1262) || defined(USE_SX1268) || defined(SX126X_RX_BOOSTED_GAIN)
+#if defined(USE_SX1262) || defined(USE_SX1268) || defined(USE_LR1121) || defined(SX126X_RX_BOOSTED_GAIN)
       radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain != 0);
 #endif
       radio_driver.radioRelease();
@@ -3430,6 +4713,8 @@ void MyMesh::handleCmdFrame(size_t len) {
     // first — the same contract the on-device power menu honors. Skipping this
     // was the "read and unread messages deleted after a manual reboot" report.
     if (_ui) _ui->persistHistoryNow();
+    persistSyncHistoryNow();   // and the app-sync replay ring
+    persistProtocolClockBeforeReset(getRTCClock());
     board.reboot();
   } else if (cmd_frame[0] == CMD_GET_BATT_AND_STORAGE) {
     uint8_t reply[11];
@@ -3818,11 +5103,40 @@ void MyMesh::handleCmdFrame(size_t len) {
     char *np = strchr(sp, ':'); // look for separator char
     if (np) {
       *np++ = 0; // modify 'cmd_frame', replace ':' with null
+      // #256: "ble.rxlog:1" opts THIS session's BLE companion into the full
+      // per-packet RX log (0x88). It is not a sensor setting, so intercept it
+      // before the sensor dispatch below. Coverage/region apps need it because
+      // the transport codes and the full relay path exist only in that frame —
+      // RESP_CODE_CHANNEL_MSG_RECV_V3 carries neither. Off by default and never
+      // persisted, so the #46/#54 fix stands for everyone who does not ask.
+      // Requested by the KiekR author (marcelverdult), who traced it for us.
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+      if (strcmp(sp, "ble.rxlog") == 0) {
+        MultiTransportCompanionInterface::bleSetRxLogFirehose(np[0] == '1');
+        writeOKFrame();
+        return;
+      }
+#endif
       bool success = sensors.setSettingValue(sp, np);
       if (success) {
         #if ENV_INCLUDE_GPS == 1
         // Update node preferences for GPS settings
         if (strcmp(sp, "gps") == 0) {
+          // Companion-app "gps on" mid-session: same 4 KB RX-ring upgrade the
+          // touch UI's toggleGPS does — the boot-time gate in main.cpp only
+          // installs it when gps_enabled was already persisted, and
+          // setRxBufferSize is a no-op on the running UART. Matches
+          // setSettingValue's own enable test (anything but "0" starts the
+          // GPS — not just "1"), and runs only on SUCCESS so a refused enable
+          // (no GPS detected on the V4/R8 detect path) doesn't pay the 4 KB.
+          // Cycling just after start is benign: everything here runs on
+          // loopTask, and the module has barely powered up (EN-pin boards) or
+          // at worst loses one torn, checksum-rejected sentence (EN-less
+          // boards, whose modules stream even while "stopped").
+          if (strcmp(np, "0") != 0) {
+            extern void gpsEnsureBigRxRing();
+            gpsEnsureBigRxRing();
+          }
           _prefs.gps_enabled = (np[0] == '1') ? 1 : 0;
           savePrefs();
         } else if (strcmp(sp, "gps_interval") == 0) {
@@ -3841,20 +5155,28 @@ void MyMesh::handleCmdFrame(size_t len) {
   } else if (cmd_frame[0] == CMD_GET_ADVERT_PATH && len >= PUB_KEY_SIZE+2) {
     // FUTURE use:  uint8_t reserved = cmd_frame[1];
     uint8_t *pub_key = &cmd_frame[2];
-    AdvertPath* found = NULL;
+    AdvertPath found = {};
+    bool has_found = false;
+#if defined(ESP32)
+    portENTER_CRITICAL(&advert_paths_mux);
+#endif
     for (int i = 0; i < ADVERT_PATH_TABLE_SIZE; i++) {
-      auto p = &advert_paths[i];
-      if (memcmp(p->pubkey_prefix, pub_key, sizeof(p->pubkey_prefix)) == 0) {
+      const AdvertPath& p = advert_paths[i];
+      if (p.used && memcmp(p.pubkey_prefix, pub_key, sizeof(p.pubkey_prefix)) == 0) {
         found = p;
+        has_found = true;
         break;
       }
     }
-    if (found) {
+#if defined(ESP32)
+    portEXIT_CRITICAL(&advert_paths_mux);
+#endif
+    if (has_found) {
       out_frame[0] = RESP_CODE_ADVERT_PATH;
-      memcpy(&out_frame[1], &found->recv_timestamp, 4);
-      out_frame[5] = found->path_len;
-      memcpy(&out_frame[6], found->path, found->path_len);
-      _serial->writeFrame(out_frame, 6 + found->path_len);
+      memcpy(&out_frame[1], &found.recv_timestamp, 4);
+      out_frame[5] = found.path_len;
+      memcpy(&out_frame[6], found.path, found.path_len);
+      _serial->writeFrame(out_frame, 6 + found.path_len);
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND);
     }
@@ -4024,6 +5346,7 @@ void MyMesh::saveContacts() {
   // freshly-written contact set + resets the refresh window.
   _last_saved_contacts_n = getNumContacts();
   _next_contacts_refresh_save = futureMillis(CONTACTS_REFRESH_SAVE_INTERVAL);
+  _next_contacts_add_save     = futureMillis(CONTACTS_ADD_SAVE_MIN_INTERVAL);
 }
 
 void MyMesh::enterCLIRescue() {
@@ -4136,6 +5459,16 @@ void MyMesh::checkCLIRescueCmd() {
       } else {
         Serial.printf("  Error: unknown config: %s\n", config);
       }
+    } else if (strcmp(cli_command, "mqtt.status") == 0 ||
+               strcmp(cli_command, "get mqtt.status") == 0 ||
+               strcmp(cli_command, "mqtt status") == 0) {
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+      char reply[320];
+      mqttFormatStatus(reply, sizeof(reply));
+      Serial.printf("  > %s\n", reply);
+#else
+      Serial.println("  > mqtt: unavailable on this build");
+#endif
     } else if (strcmp(cli_command, "get wifi.ssid") == 0) {
 #ifdef ESP32
 #if defined(WIFI_SSID) || defined(MULTI_TRANSPORT_COMPANION)
@@ -4354,7 +5687,23 @@ void MyMesh::checkCLIRescueCmd() {
 
       }
 
+#if defined(ESP32)
+    } else if (memcmp(cli_command, "fput ", 5) == 0) {
+      // Serial sideload (scripts/sideload_app.py). Boards with a soldered card
+      // (the ThinkNode M9) have no other way to get a Lua app or a .lang file
+      // onto the device than the Store's own download, so: "fput /apps/<name>"
+      // opens the file, "fadd <off> <len> <sum> <base64>" lines append to it
+      // (self-checking, see cliPutChunk), "fend" closes it.
+      // Same physical-access trust level as "rm" and "erase" above, with a
+      // NARROWER scope: Store files plus one app's private <id>.d directory.
+      cliPutBegin(&cli_command[5]);
+    } else if (memcmp(cli_command, "fadd ", 5) == 0) {
+      cliPutChunk(&cli_command[5]);
+    } else if (strcmp(cli_command, "fend") == 0) {
+      cliPutEnd();
+#endif
     } else if (strcmp(cli_command, "reboot") == 0) {
+      persistProtocolClockBeforeReset(getRTCClock());
       board.reboot();  // doesn't return
     } else {
       Serial.println("  Error: unknown command");
@@ -4363,6 +5712,110 @@ void MyMesh::checkCLIRescueCmd() {
     cli_command[0] = 0;  // reset command buffer
   }
 }
+
+#if defined(ESP32)
+// ---- serial sideload: fput / fadd / fend -----------------------------------
+// Writes go to the same storage the Store installs into (the hot-data FS,
+// root-aware: the SD card's /meshcomod on an adopted card, the internal FS
+// otherwise). Replies are single lines the host script keys on: "ok ..." or
+// "Error: ...".
+void MyMesh::cliPutBegin(const char* path) {
+  if (_cli_put) { _cli_put.close(); _cli_put_len = 0; }
+  _cli_put_ended = false;
+  const char* dir = nullptr;
+  if (memcmp(path, "/apps/", 6) == 0) dir = "/apps";
+  else if (memcmp(path, "/lang/", 6) == 0) dir = "/lang";
+  if (!dir) { Serial.println("Error: path must be /apps/<name> or /lang/<name>"); return; }
+  const char* name = path + 6;
+  const char* slash = strchr(name, '/');
+  const char* leaf = slash ? slash + 1 : name;
+  const size_t dir_len = slash ? (size_t)(slash - name) : 0;
+  const size_t leaf_len = strlen(leaf);
+  if (!leaf_len || leaf_len > 40 || (slash && leaf_len > 32) ||
+      leaf[0] == '.' || strchr(leaf, '/')) {
+    Serial.println("Error: bad file name");
+    return;
+  }
+  for (size_t i = 0; i < leaf_len; i++) {
+    const char c = leaf[i];
+    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+    if (!ok) { Serial.println("Error: file name may only use A-Z a-z 0-9 . _ -"); return; }
+  }
+
+  char app_data_dir[48] = "";
+  if (slash) {
+    // The only nested destination is /apps/<id>.d/<file>, matching wada.fs.
+    if (strcmp(dir, "/apps") != 0 || dir_len < 3 || dir_len > 25 ||
+        name[dir_len - 2] != '.' || name[dir_len - 1] != 'd' || name[0] == '.') {
+      Serial.println("Error: nested path must be /apps/<id>.d/<name>");
+      return;
+    }
+    for (size_t i = 0; i + 2 < dir_len; i++) {
+      const char c = name[i];
+      const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                      (c >= '0' && c <= '9') || c == '_' || c == '-';
+      if (!ok) { Serial.println("Error: bad app id"); return; }
+    }
+    snprintf(app_data_dir, sizeof app_data_dir, "/apps/%.*s", (int)dir_len, name);
+  }
+  FILESYSTEM* fs = _store->getHotDataFS();
+  if (!fs) { Serial.println("Error: storage not ready"); return; }
+  // Hierarchical filesystems create these directories. SPIFFS returns ENOTSUP
+  // but accepts the complete slash-containing path as a flat file key.
+  _store->mkdirRooted(fs, dir);
+  if (app_data_dir[0]) _store->mkdirRooted(fs, app_data_dir);
+  _cli_put = _store->openWriteRootedFlatSafe(fs, path);
+  if (!_cli_put) { Serial.printf("Error: cannot open %s for writing\n", path); return; }
+  _cli_put_len = 0;
+  Serial.printf("ok fput %s\n", path);
+}
+
+// "fadd <offset> <len> <sum> <base64>". Every field is checked before a byte
+// is written: the UART ISR is not IRAM-resident, so whenever the loop is
+// inside a flash-cache pause the hardware FIFO (128 bytes) is all that
+// buffers the line and the middle of a long one simply vanishes — a bare
+// base64 payload would then decode to plausible garbage. Offset catches a
+// lost or duplicated line, len catches truncation, the byte sum catches
+// corruption; the host re-sends on any "Error:" reply.
+void MyMesh::cliPutChunk(const char* args) {
+  if (!_cli_put) { Serial.println("Error: no file open (fput first)"); return; }
+  unsigned off = 0, len = 0, sum = 0; int consumed = 0;
+  if (sscanf(args, "%u %u %u %n", &off, &len, &sum, &consumed) != 3 || consumed == 0) {
+    Serial.println("Error: usage fadd <offset> <len> <sum> <base64>");
+    return;
+  }
+  if (off != _cli_put_len) { Serial.printf("Error: offset %u\n", (unsigned)_cli_put_len); return; }
+  const char* b64 = args + consumed;
+  uint8_t buf[160];
+  size_t olen = 0;
+  const int rc = mbedtls_base64_decode(buf, sizeof buf, &olen, (const unsigned char*)b64, strlen(b64));
+  if (rc != 0 || olen != len) { Serial.printf("Error: chunk damaged at %u\n", (unsigned)_cli_put_len); return; }
+  unsigned s = 0;
+  for (size_t i = 0; i < olen; i++) s += buf[i];
+  if ((s & 0xFFFF) != (sum & 0xFFFF)) { Serial.printf("Error: checksum at %u\n", (unsigned)_cli_put_len); return; }
+  if (olen && _cli_put.write(buf, olen) != olen) {
+    Serial.println("Error: write failed (card full?)");
+    _cli_put.close(); _cli_put_len = 0; _cli_put_ended = false;
+    return;
+  }
+  _cli_put_len += olen;
+  Serial.printf("ok fadd %u\n", (unsigned)_cli_put_len);
+}
+
+void MyMesh::cliPutEnd() {
+  if (!_cli_put) {
+    if (_cli_put_ended) Serial.printf("ok fend %u bytes\n", (unsigned)_cli_put_last_len);
+    else Serial.println("Error: no file open (fput first)");
+    return;
+  }
+  _cli_put.close();
+  _cli_put_last_len = _cli_put_len;
+  _cli_put_ended = true;
+  Serial.printf("ok fend %u bytes\n", (unsigned)_cli_put_last_len);
+  _cli_put_len = 0;
+}
+#endif  // ESP32
 
 void MyMesh::checkSerialInterface() {
   bool handled_cmd = false;
@@ -4428,6 +5881,8 @@ void MyMesh::checkSerialInterface() {
 
 void MyMesh::loop() {
   BaseChatMesh::loop();
+  companionRetryService();
+  drainPendingBlobDeletes();   // evicted contacts' blobs, off the packet path (#222)
 
   // Session keep-alives for logged-in servers (rooms). The core pinger sends the
   // 9-byte REQ_TYPE_KEEP_ALIVE (+ our sync_since) a room server expects; the ACK
@@ -4440,7 +5895,11 @@ void MyMesh::loop() {
   // transmits only when a connection is armed and due (see the room login branch).
   checkConnections();
 
-  if (_cli_rescue) {
+  if (g_usb_files_owns_serial) {
+    // USB Files owns the USB serial port (ui-touch/UsbFilesSession.h): no console
+    // on it, and the companion link skips its USB leg. BLE/TCP/WS still run.
+    checkSerialInterface();
+  } else if (_cli_rescue) {
     checkCLIRescueCmd();
   } else {
     // Prefer plain-text console commands (e.g. flasher Console) before binary
@@ -4486,6 +5945,20 @@ void MyMesh::loop() {
         && !millisHasNowPassed(_next_contacts_refresh_save)) {
       defer = true;   // no add/remove + still inside the refresh window on GC-prone flash
     }
+    // ...but a CHANGED contact count used to bypass the window entirely and rewrite the whole
+    // table immediately, every time. On a busy mesh that is the common case, not the rare one:
+    // each newly-heard node auto-added (and every transient/anon slot) bumps the count, so a
+    // burst of new nodes = a burst of full 30 KB rewrites 5 s apart, which is what drives the
+    // GC stalls a reporter measured at 11-19 s on two card-less V4s. Give add/remove its own
+    // short floor so a burst coalesces into ONE rewrite. Deliberately short (30 s, vs 5 min for
+    // pure refreshes): a new node still needs to reach flash promptly, and an unclean power loss
+    // inside the window only costs a rediscovery on that node's next advert, whereas the stall
+    // it prevents freezes the entire UI. The write stays ATOMIC (tmp + rename) — important on
+    // hardware that browns out, which is exactly what these reporters' boards do.
+    if (!defer && _store->contactsOnInternalFlash()
+        && !millisHasNowPassed(_next_contacts_add_save)) {
+      defer = true;
+    }
 #endif
     if (defer) {
       dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);   // re-check soon; don't rewrite yet
@@ -4494,6 +5967,7 @@ void MyMesh::loop() {
       dirty_contacts_expiry = 0;
     }
   }
+  serviceSyncHistory();   // coalesced app-sync ring / cursor writes
 
 #if defined(ENABLE_ADVERT_ON_BOOT) && ENABLE_ADVERT_ON_BOOT == 1
   // Fire the one-shot boot advert when the scheduled time passes. Flood so
@@ -4561,7 +6035,9 @@ bool MyMesh::sendAdvert(bool flood) {
   if (_prefs.advert_loc_policy == ADVERT_LOC_NONE) {
     pkt = createSelfAdvert(_prefs.node_name);
   } else {
-    pkt = createSelfAdvert(_prefs.node_name, sensors.node_lat, sensors.node_lon);
+    { double alat = sensors.node_lat, alon = sensors.node_lon;
+        advertPosition(alat, alon);
+        pkt = createSelfAdvert(_prefs.node_name, alat, alon); }
   }
   if (!pkt) return false;
   if (flood) {
@@ -4580,7 +6056,37 @@ bool MyMesh::sendAdvert(bool flood) {
   return true;
 }
 
-// To check if there is pending work
+bool MyMesh::getNextCompanionRetryWakeDelay(uint32_t& delay_millis) const {
+  if (_active_companion_retries == 0) return false;
+
+  const uint32_t now = _ms->getMillis();
+  bool found = false;
+  uint32_t shortest_delay = 0;
+  for (int i = 0; i < COMPANION_RETRY_SLOTS; i++) {
+    const CompanionRetrySlot& slot = _companion_retries[i];
+    if (!slot.active) continue;
+
+    const uint32_t candidate = CompanionRetryPolicy::wakeDelay(now, slot.retry_at);
+    if (!found || candidate < shortest_delay) {
+      shortest_delay = candidate;
+      found = true;
+    }
+  }
+  if (found) delay_millis = shortest_delay;
+  return found;
+}
+
+// Future queue entries, retry echo windows, and contact-write timers are wake
+// deadlines; they should not prevent the MCU's idle power-saving path. Report
+// only work that is due now. An in-flight retry keeps retry_at in the past until
+// its TX callback runs, so the CPU remains awake while the radio is transmitting.
 bool MyMesh::hasPendingWork() const {
-  return _mgr->getOutboundTotal() > 0 || dirty_contacts_expiry != 0;
+  const uint32_t now = _ms->getMillis();
+  if (_mgr->getOutboundCount(now) > 0) return true;
+  if (dirty_contacts_expiry != 0 && millisHasNowPassed(dirty_contacts_expiry)) {
+    return true;
+  }
+
+  uint32_t retry_delay = 0;
+  return getNextCompanionRetryWakeDelay(retry_delay) && retry_delay == 0;
 }

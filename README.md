@@ -8,7 +8,7 @@
 <p align="center"><b>A real touchscreen UI for your mesh radio.</b> &middot; open source &middot; GPL-3.0</p>
 
 Touch-UI [MeshCore](https://github.com/meshcore-dev/MeshCore) companion-radio
-firmware for the **LilyGo T-Deck / T-Deck Plus** and **Heltec V4 + TFT**
+firmware for the **LilyGo T-Deck / T-Deck Plus**, **Heltec V4 + TFT** and eight other boards
 (ESP32-S3).
 
 An LVGL touch UI — map, chat, contacts, channels, settings — split out of
@@ -22,14 +22,18 @@ per-board status.
 
 - LilyGo T-Deck / T-Deck Plus — env `LilyGo_TDeck_companion_radio_touch` (stable)
 - Heltec V4 + TFT + CHSC6x touch — env `heltec_v4_tft_companion_radio_usb_tcp_touch` (stable)
-- Tanmatsu (ESP32-P4) — built from `tanmatsu/` (ESP-IDF), ships via the Tanmatsu app store
-- Elecrow ThinkNode M9 — env `ThinkNode_M9_companion_radio_touch` (beta)
+- Tanmatsu (ESP32-P4) — built from `tanmatsu/` (ESP-IDF), ships via the Tanmatsu app store — [sideload guide](TANMATSU_SIDELOAD.md) for running your own build
+- Elecrow ThinkNode M9 — env `ThinkNode_M9_companion_radio_touch` (beta) — [keyboard & d-pad guide](THINKNODE_M9_SHORTCUTS.md)
 - RAK WisMesh Tap V2 (RAK3312) — env `rak_tap_v2_companion_radio_touch` (beta)
+- LilyGo T-Lora Pager — envs `tlora_pager_lr1121_companion_radio_touch` / `tlora_pager_sx1262_companion_radio_touch` (beta) — [keyboard shortcuts](TLORA_PAGER_SHORTCUTS.md)
+- Heltec V4-R8 + Expansion Kit V2 — env `heltec_v4_r8_tft_companion_radio_usb_tcp_touch` (beta)
+- LilyGo T-Display P4 — built from `tdisplay_p4/` (ESP-IDF); AMOLED by default, `WADA_P4_LCD=1` for the TFT-LCD SKU (beta)
+- Attaky Mesh Series — env `attaky_mesh_series_companion_radio_touch` (beta)
 
 ## Architecture
 
 This repo holds only the **app**: the `companion_radio` glue, the `ui-touch`
-LVGL UI, the two boards' glue/variants, and `platformio.ini`. The **MeshCore
+LVGL UI, each board's glue/variants, and `platformio.ini`. The **MeshCore
 core is not vendored here** — it's pulled as a library via `lib_deps` from the
 [`ALLFATHER-BV/meshcomod`](https://github.com/ALLFATHER-BV/meshcomod) monorepo
 (the same repo as the non-touch firmware), pinned by a lean source-only `core-*`
@@ -37,6 +41,54 @@ git tag. The touch-app files this repo owns (TouchPrefsStore, WifiRuntimeStore,
 the transports, …) are dropped from the lib via `-DMC_VENDORED_TOUCH_APP` so they
 aren't compiled twice. The build is byte-identical to the original in-tree
 meshcomod firmware.
+
+Lua apps use the on-device SDK described in [LUA_APPS.md](LUA_APPS.md). For
+WAV/MP3 playback, including a ready-to-sideload transport test app and exact SD
+and internal-storage paths, see [AUDIO_PLAYBACK_TESTING.md](AUDIO_PLAYBACK_TESTING.md).
+Region discovery, known-region management, and per-channel flood scopes are
+described in [REGIONS.md](REGIONS.md).
+
+## Offline map tiles
+
+Builds with a microSD card expose a **Transfer** app for authenticated browser
+uploads over the local Wi-Fi network. WadaMesh accepts unpacked 256x256 PNG XYZ
+tiles in a `z/x/y.png` directory tree.
+
+To create a compatible pack with [QGIS](https://qgis.org/):
+
+1. Add a map source whose licence and service terms explicitly permit offline
+  or bulk use. A self-hosted source is also suitable. Do **not** bulk-download
+  from `tile.openstreetmap.org`: the official
+  [OSM tile policy](https://operations.osmfoundation.org/policies/tiles/)
+  prohibits offline downloads from that community service.
+2. Frame only the area needed in the QGIS map canvas. Tile counts quadruple at
+  every added zoom level, so a small region and a practical range such as
+  zoom 8 through 16 are preferable to exporting an entire country at zoom 19.
+3. Open **Processing Toolbox → Raster tools → Generate XYZ tiles (Directory)**.
+4. Use the map-canvas extent, choose minimum and maximum zooms within 3–19,
+  select **PNG**, set tile width and height to **256**, leave **Use inverted
+  tile Y axis (TMS conventions)** disabled, and select an output directory.
+5. Confirm the output contains paths such as `12/2048/1362.png`. If obtaining
+  an existing pack instead, extract it first and confirm it has the same XYZ
+  directory layout and that its provider permits offline use and redistribution.
+
+To upload the pack:
+
+1. Connect the device and the browser to the same Wi-Fi network.
+2. Open **Transfer** from the device's app drawer, visit the displayed URL, and
+  enter the six-digit session code.
+3. Choose **Offline OSM map (/tiles)**, select the generated output folder, and
+  start the upload. The browser ignores unrelated files and uploads valid tiles
+  sequentially while preserving their coordinates.
+4. Existing tiles are skipped by default, allowing an interrupted upload to be
+  resumed. Enable **Replace existing map tiles** when intentionally refreshing
+  a pack.
+5. Close Transfer after completion. In **Map options**, disable **Topographic
+  map** and enable **Tiles from SD card**. Disable Wi-Fi to verify that the
+  uploaded area renders offline.
+
+Individual PNG tiles must be no larger than 256 KB. Keep the map provider's
+required attribution and licence information with any pack you distribute.
 
 ## Build
 

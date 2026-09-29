@@ -38,7 +38,7 @@
 #endif
 
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.16.0-touch"
+#define FIRMWARE_VERSION "v1.17.4-touch"
 #endif
 
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
@@ -108,6 +108,7 @@
 
 #include <helpers/BaseChatMesh.h>
 #include <helpers/TransportKeyStore.h>
+#include "RegionRegistry.h"
 
 /* -------------------------------------------------------------------------------------- */
 
@@ -120,7 +121,17 @@ struct AdvertPath {
   uint8_t path_len;
   char    name[32];
   uint32_t recv_timestamp;
+  uint32_t recv_seq;
+  uint8_t type;
+  bool used;
   uint8_t path[MAX_PATH_SIZE];
+};
+
+struct RecentlyHeardName {
+  uint8_t pubkey_prefix[7];
+  char name[32];
+  uint32_t recv_seq;
+  uint8_t type;
 };
 
 class MyMesh : public BaseChatMesh, public DataStoreHost {
@@ -130,10 +141,23 @@ public:
   void begin(bool has_display);
   void startInterface(BaseSerialInterface &serial);
 
+  // Keep WadaMesh's queued text packets intact around the pinned core's
+  // sendMessage/sendCommandData implementations.  That core currently drops
+  // every queued TXT before enqueueing a new one; these wrappers restore FIFO
+  // behavior and let MyMesh replace only the same logical private message.
+  int sendMessage(const ContactInfo& recipient, uint32_t timestamp, uint8_t attempt,
+                  const char* text, uint32_t& expected_ack, uint32_t& est_timeout,
+                  uint32_t* out_packet_hash4 = nullptr, TxtTxDebugInfo* out_dbg = nullptr);
+  int sendCommandData(const ContactInfo& recipient, uint32_t timestamp, uint8_t attempt,
+                      const char* text, uint32_t& est_timeout,
+                      uint32_t* out_packet_hash4 = nullptr, TxtTxDebugInfo* out_dbg = nullptr);
+
   const char *getNodeName();
   NodePrefs *getNodePrefs();
   uint32_t getBLEPin();
   bool     setBLEPin(uint32_t pin);   // user-chosen 6-digit pairing code (persisted; applies next boot)
+  uint32_t getOrphanedBlobs() const { return _orphaned_blobs; }   // see PENDING_DEL_MAX (#222)
+  DataStore* getStore() { return _store; }                        // for the About diagnostics
 
   // Live device info accessors (used by the touch Settings → Device modal to
   // mirror the web client's "Device (live)" panel — public key prefix, channel
@@ -212,7 +236,10 @@ public:
   bool sendAdvert(bool flood);
   void enterCLIRescue();
 
-  int  getRecentlyHeard(AdvertPath dest[], int max_num);
+  int  getRecentlyHeard(RecentlyHeardName dest[], int max_num);
+  bool uiIsMeshcomodRecipient(const uint8_t* pub_key_prefix_6) const {
+    return isMeshcomodRecipient(pub_key_prefix_6);
+  }
 
   // On-device terminal: register an output sink (nullptr = off) and run a local
   // CLI command. Replies flow through pushMeshcomodReply -> the sink.
@@ -245,11 +272,25 @@ protected:
   void sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t delay_millis=0) override;
 
   void logRxRaw(float snr, float rssi, const uint8_t raw[], int len) override;
+  void logTx(mesh::Packet* packet, int len) override;
+  void logTxFail(mesh::Packet* packet, int len) override;
   bool isAutoAddEnabled() const override;
   bool shouldAutoAddContactType(uint8_t type) const override;
   bool shouldOverwriteWhenFull() const override;
   void onContactsFull() override;
   void onContactOverwrite(const uint8_t* pub_key) override;
+  // Blob deletes queued by onContactOverwrite and drained from loop() — never
+  // from packet handling, see #222 (SPIFFS GC stalls both cores).
+  // 8 was too shallow: a drop here does not just skip work, it ORPHANS the blob file
+  // permanently (nothing else ever deletes it), and orphans accumulate on the one
+  // resource that drives GC cost — how full the volume is. 32 costs 1 KB of RAM and
+  // needs a 16-second eviction burst to overflow.
+  static const uint8_t PENDING_DEL_MAX = 32;
+  uint8_t _pending_del[PENDING_DEL_MAX][PUB_KEY_SIZE];
+  uint8_t _pending_del_n = 0;
+  uint32_t _next_pending_del_at = 0;
+  uint16_t _orphaned_blobs = 0;   // queue overflows — each one leaks a blob file for good
+  void drainPendingBlobDeletes();
   bool onContactPathRecv(ContactInfo& from, uint8_t* in_path, uint8_t in_path_len, uint8_t* out_path, uint8_t out_path_len, uint8_t extra_type, uint8_t* extra, uint8_t extra_len) override;
   void onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path_len, const uint8_t* path) override;
   void onContactPathUpdated(const ContactInfo &contact) override;
@@ -263,6 +304,24 @@ protected:
                          const char *text) override;
   void onSignedMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,
                            const uint8_t *sender_prefix, const char *text) override;
+  // An UNCONFIGURED channel slot is all zeroes — including its secret, its hash
+  // and its name. Both core lookups treat such a slot as a real channel, which
+  // is what produced the "#unknown" threads (#260): a device that transmits on
+  // an unconfigured slot encrypts with an all-zero key, and every receiver with
+  // a spare slot decrypts it successfully against that same all-zero key, then
+  // resolves the name to "" and files the message under a nameless thread.
+  // Treat "has a non-zero secret" as the definition of a real channel.
+  static bool channelSlotConfigured(const ChannelDetails& cd) {
+    for (size_t i = 0; i < sizeof(cd.channel.secret); i++) if (cd.channel.secret[i]) return true;
+    return false;
+  }
+  /** findChannelIdx() that ignores unconfigured slots. -1 = not one of ours. */
+  int findConfiguredChannelIdx(const mesh::GroupChannel& ch) const;
+  /** Decrypt candidates for a received group packet, unconfigured slots excluded.
+   *  Also stops empty slots (hash byte 0x00) from filling the 4-entry candidate
+   *  array and starving out a REAL channel whose hash byte happens to be 0x00 —
+   *  that one silently dropped the message instead of misfiling it. */
+  int searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel dest[], int max_matches) override;
   void onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint32_t timestamp,
                             const char *text) override;
 
@@ -291,7 +350,7 @@ protected:
 public:
   /** Which kind of touch-UI request is currently in flight, so the response
    *  matcher in onContactResponse routes to the right callback. */
-  enum class UiReqKind : uint8_t { None = 0, Status = 1, Telemetry = 2 };
+  enum class UiReqKind : uint8_t { None = 0, Status = 1, Telemetry = 2, Regions = 3 };
 
   /** Fire a REQ_TYPE_GET_STATUS from the touch UI side. Result is delivered
    *  via AbstractUITask::onPingReply when the reply arrives.
@@ -310,6 +369,25 @@ public:
     return r;
   }
 
+  /** Does a blank-password LOGIN mean anything to this contact?
+   *
+   *  Only to a node that keeps an ACL: repeaters, room servers and sensors.
+   *  A plain chat contact is another companion, which has no LOGIN handler at
+   *  all. Chaining one in front of a request there either wastes a packet (the
+   *  fire-and-forget helpers below) or, in the deferred path, arms a wait for a
+   *  LOGIN-OK that can never arrive -- so the request is never sent and the UI
+   *  reports a failure.
+   *
+   *  That is why telemetry and position for a chat contact worked from the
+   *  phone app, which sends the request straight out, and never worked from the
+   *  device (#293). The map went stale with it: a contact's position is
+   *  refreshed from the CayenneLPP GPS field in a telemetry reply, and there
+   *  was no reply. */
+  static bool contactNeedsGuestLogin(const ContactInfo& c) {
+    return c.type == ADV_TYPE_REPEATER || c.type == ADV_TYPE_ROOM ||
+           c.type == ADV_TYPE_SENSOR;
+  }
+
   /** Same as sendStatusPingForUI, but sends an unauthenticated guest LOGIN
    *  first. Repeaters need the sender to be in their ACL before they will
    *  decrypt a PAYLOAD_TYPE_REQ; the ACL is only populated by handleLoginReq.
@@ -320,17 +398,32 @@ public:
    *  No-op if the LOGIN packet pool is empty; falls through to send the
    *  STATUS REQ anyway so a repeater that already knows us still replies. */
   int sendStatusPingWithGuestLoginForUI(ContactInfo& recipient) {
-    uint32_t login_est = 0;
-    sendLogin(recipient, "", login_est);
+    if (contactNeedsGuestLogin(recipient)) {
+      uint32_t login_est = 0;
+      sendLogin(recipient, "", login_est);
+    }
     return sendStatusPingForUI(recipient);
   }
 
   /** Same chained-login flavour for telemetry — repeaters and sensors also
    *  require ACL membership for REQ_TYPE_GET_TELEMETRY_DATA. */
   int sendTelemetryRequestWithGuestLoginForUI(ContactInfo& recipient) {
-    uint32_t login_est = 0;
-    sendLogin(recipient, "", login_est);
+    if (contactNeedsGuestLogin(recipient)) {
+      uint32_t login_est = 0;
+      sendLogin(recipient, "", login_est);
+    }
     return sendTelemetryRequestForUI(recipient);
+  }
+
+  /** Interactive logins must rediscover the route. MeshCore 1.16 repeaters
+   *  answer a direct login by flooding the response without refreshing their
+   *  return path; a flooded login returns PATH + LOGIN_OK and refreshes both
+   *  sides before the deferred request or first admin command is sent. */
+  void uiResetPathForLogin(ContactInfo& recipient) {
+    if (recipient.out_path_len == OUT_PATH_UNKNOWN) return;
+    uiResetContactPath(recipient.id.pub_key);
+    recipient.out_path_len = OUT_PATH_UNKNOWN;
+    memset(recipient.out_path, 0, sizeof(recipient.out_path));
   }
 
   /** Touch-UI manual STATUS/TELEMETRY request that DEFERS the REQ until the
@@ -347,6 +440,13 @@ public:
    *  auto-poll keeps the immediate chained send above (a single arm slot can't
    *  serve its multi-node loop, and a missed poll just retries next interval). */
   int uiSendRequestAfterGuestLogin(ContactInfo& recipient, UiReqKind kind) {
+    // Nothing to defer behind on a companion: send the request itself, now.
+    if (!contactNeedsGuestLogin(recipient)) {
+      cancelUIDeferredLogin();
+      return (kind == UiReqKind::Telemetry) ? sendTelemetryRequestForUI(recipient)
+                                            : sendStatusPingForUI(recipient);
+    }
+    uiResetPathForLogin(recipient);
     uint32_t login_est = 0;
     int r = sendLogin(recipient, "", login_est);
     if (r == MSG_SEND_SENT_FLOOD || r == MSG_SEND_SENT_DIRECT) {
@@ -363,11 +463,19 @@ public:
    *  pending_login so onContactResponse's existing login branch can route
    *  the response. The same branch now also fires
    *  AbstractUITask::onAdminLoginResult so the UI can flip from "logging
-   *  in…" to "logged in" (or "failed"). */
+   *  in…" to "logged in" (or "failed"). Interactive login floods always
+   *  use the legacy-compatible one-byte path hash: older room/repeater
+   *  firmware silently drops packets using the optional wider hashes. */
+  static constexpr uint8_t UI_LOGIN_FLOOD_HASH_SIZE = 1;
   int uiSendAdminLogin(ContactInfo& recipient, const char* password) {
+    uiResetPathForLogin(recipient);
     uint32_t est = 0;
+    const uint8_t previous_hash_override = _flood_path_hash_size_override;
+    _flood_path_hash_size_override = UI_LOGIN_FLOOD_HASH_SIZE;
     int r = sendLogin(recipient, password ? password : "", est);
+    _flood_path_hash_size_override = previous_hash_override;
     if (r == MSG_SEND_SENT_FLOOD || r == MSG_SEND_SENT_DIRECT) {
+      // BaseChatMesh::sendLogin() only transmits; MyMesh owns this response matcher.
       memcpy(&pending_login, recipient.id.pub_key, 4);
     }
     // Diagnostic (room-server login trace): which contact/type we sent the login
@@ -396,11 +504,23 @@ public:
    *  push-abandon counter, so pushes resume (issue #89: self-heal + the chat
    *  sheet's "Log in again"). NOTE it cannot recover a server that REBOOTED
    *  (non-admin ACL entries aren't persisted there) — that needs a passworded
-   *  Join from the Contacts sheet. */
+   *  Join, which the UI escalates to when this gets no LOGIN_OK (#267). */
   int uiRoomRelogin(const uint8_t pub_key[32]) {
     ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
     if (!c || c->type != ADV_TYPE_ROOM) return MSG_SEND_FAILED;
     return uiSendAdminLogin(*c, "");
+  }
+
+  /** Contact-table INDEX for a public key, or -1. lookupContactByPubKey returns
+   *  the record; the touch UI's room-join path needs the index instead, because
+   *  that is what openMeshContactDm() takes (#267). */
+  int uiContactIdxByPubKey(const uint8_t pub_key[32]) {
+    const uint32_t n = getNumContacts();
+    for (uint32_t i = 0; i < n; ++i) {
+      ContactInfo c;
+      if (getContactByIdx(i, c) && memcmp(c.id.pub_key, pub_key, PUB_KEY_SIZE) == 0) return (int)i;
+    }
+    return -1;
   }
 
   /** Send a CLI command line to a previously-logged-in repeater / room
@@ -428,24 +548,17 @@ public:
   }
   /** True if a UI ping is still waiting on a reply. */
   bool hasUIPingPending() const { return _ui_pending_status != 0; }
+  /** True while any single-flight UI request or its prerequisite login is active. */
+  bool hasUIRequestPending() const {
+    return _ui_pending_status != 0 || _ui_login_then != 0;
+  }
 
   /** Register an expected ACK hash that came out of a touch-UI sendMessage
    *  call, so MyMesh::processAck can match the inbound ACK and dispatch
    *  onMessageAcked back to the UI. The companion-serial CMD_SEND_TXT_MSG
    *  handler already does this for app-originated messages; the touch UI
    *  reaches sendMessage directly and skipped this until now. */
-  void uiRegisterExpectedAck(uint32_t expected_ack, const uint8_t pub_key[32]) {
-    if (expected_ack == 0) return;
-    ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
-    if (!c) return;
-    expected_ack_table[next_ack_idx].msg_sent = _ms->getMillis();
-    expected_ack_table[next_ack_idx].ack = expected_ack;
-    expected_ack_table[next_ack_idx].contact = c;
-    // EXPECTED_ACK_TABLE_SIZE is #defined further down in this header next
-    // to the table itself; hard-code 8 here so this inline helper compiles
-    // wherever it's used.
-    next_ack_idx = (next_ack_idx + 1) % 8;
-  }
+  void uiRegisterExpectedAck(uint32_t expected_ack, const uint8_t pub_key[32]);
 
   // ---- "Repeats heard" for sent floods + route of the last received flood ----
   // When we originate a flood TXT, repeaters re-broadcast it and our own radio
@@ -467,6 +580,12 @@ public:
   uint8_t  _last_rx_path[32] = {0};
   uint8_t  _last_rx_path_n  = 0;
   uint16_t _last_rx_scope     = 0;     // transport_codes[0] of the last RX flood ("scope")
+  bool     _last_rx_scope_home = false; // that code verified against OUR region key (#259)
+  // Which REGISTERED region that code verified against (#271): a stable slot,
+  // REGION_SLOT_AMBIGUOUS when several matched, or REGION_SLOT_NONE. Widens the
+  // one-key _last_rx_scope_home check above to every region the user tracks.
+  uint8_t  _last_rx_scope_slot = REGION_SLOT_NONE;
+  RegionRegistry _region_reg;
   bool     _last_rx_has_scope = false; // false if the packet carried no transport codes
   uint32_t _last_sender_ts    = 0;     // embedded send-time of the last inbound msg (UI bubble ts; 0 = use now)
   volatile bool _echo_dirty = false;   // a repeat was counted -> UI should refresh
@@ -481,6 +600,36 @@ public:
   int8_t   uiSignalRssi()  const { return _ui_sig_rssi; }
   uint32_t uiSignalMs()    const { return _ui_sig_ms; }
 
+  // ---- Discover scan (the Discover app: active node-discovery, ALL node types) ----
+  // uiStartDiscoverScan() broadcasts a zero-hop NODE_DISCOVER_REQ with a type filter + a fresh
+  // random tag; EVERY neighbour that answers with a NODE_DISCOVER_RESP is upserted here (keyed by
+  // pubkey prefix) from onControlDataRecv. Unlike the single-scalar signal probe, every responder
+  // is kept, with BOTH link directions (our RX of them + their RX of us, from RESP payload[1]).
+  struct DiscoverHit {
+    uint8_t  pubkey[32];    // responder identity (full key — the REQ sets prefix_only=0)
+    uint8_t  node_type;     // ADV_TYPE_* (RESP payload[0] low nibble): repeater/chat/room/sensor
+    int8_t   our_snr_q4;    // our RX SNR*4 of their reply (forward link)
+    int8_t   our_rssi;      // our RX RSSI dBm of their reply
+    int8_t   their_snr_q4;  // their RX SNR*4 of our request (reverse link — RESP payload[1])
+    uint8_t  path_len;      // hops the reply travelled (0 = heard directly, i.e. in RF range)
+    uint32_t first_ms;      // millis() first heard this session
+    uint32_t last_ms;       // millis() last heard
+    uint16_t heard;         // reply count
+  };
+  static const int DISCOVER_MAX = 64;
+  DiscoverHit _discover[DISCOVER_MAX];
+  uint8_t     _discover_cnt = 0;
+  uint32_t    _discover_tag = 0;      // active scan tag (matches RESPs; 0 = no scan yet)
+  uint32_t    _discover_scan_ms = 0;  // millis() the current scan sweep was fired
+  uint8_t  discoverCount() const { return _discover_cnt; }
+  bool     discoverGet(uint8_t i, DiscoverHit& out) const {
+    if (i >= _discover_cnt) return false; out = _discover[i]; return true;
+  }
+  void     discoverClear() { _discover_cnt = 0; }
+  uint32_t discoverScanMs() const { return _discover_scan_ms; }
+  void     discoverUpsert(const uint8_t* pk, uint8_t pklen, uint8_t node_type,
+                          int8_t our_snr_q4, int8_t our_rssi, int8_t their_snr_q4, uint8_t path_len);
+
   // ---- Recent-RX ring (RF Monitor app) ----
   // One record per received frame, captured in logRxRaw(): payload type / route
   // / hop count / length + signal, so the Monitor page can show a live "what am
@@ -494,6 +643,16 @@ public:
     uint8_t  route;     // route type    raw[0]&0x03
     uint8_t  hops;      // path length carried (0 = heard direct from origin)
     uint8_t  len;       // frame length (clamped to 255)
+    // Who sent it, as far as the frame actually says. MeshCore only carries a
+    // full identity on an ADVERT (the payload opens with the 32-byte public
+    // key); the addressed types carry one-byte destination/source hashes, and
+    // the rest carry nothing at all. Recorded honestly rather than guessed, so
+    // a caller can tell "node X was here" from "something was here".
+    //   org_kind 0 = nothing identifying in this frame
+    //            1 = org[0..3] is the first 4 bytes of the origin's public key
+    //            2 = org[0] is the destination hash, org[1] the source hash
+    uint8_t  org_kind;
+    uint8_t  org[4];
   };
   static const int UI_RXLOG_MAX = 16;
   UiRxRec  _ui_rxlog[UI_RXLOG_MAX];
@@ -508,10 +667,13 @@ public:
   }
   // Record a reception into the ring (called from logRxRaw).
   void uiRxLogPush(uint32_t ms, int8_t rssi, int8_t snr_q4,
-                   uint8_t ptype, uint8_t route, uint8_t hops, uint8_t len) {
+                   uint8_t ptype, uint8_t route, uint8_t hops, uint8_t len,
+                   uint8_t org_kind = 0, const uint8_t* org = nullptr) {
     UiRxRec& r = _ui_rxlog[_ui_rxlog_head];
     r.ms = ms; r.rssi = rssi; r.snr_q4 = snr_q4;
     r.ptype = ptype; r.route = route; r.hops = hops; r.len = len;
+    r.org_kind = org ? org_kind : 0;
+    if (r.org_kind) memcpy(r.org, org, 4); else memset(r.org, 0, 4);
     _ui_rxlog_head = (uint8_t)((_ui_rxlog_head + 1) % UI_RXLOG_MAX);
     if (_ui_rxlog_cnt < UI_RXLOG_MAX) _ui_rxlog_cnt++;
   }
@@ -521,6 +683,8 @@ public:
 
   /** Echoes (repeater re-broadcasts) heard of the flood TXT with this payload
    *  fingerprint. 0 if unknown / evicted from the ring. */
+  // Displace the position we ADVERTISE (#399); local readings keep the true fix.
+  void advertPosition(double& lat, double& lon) const;
   uint8_t uiRepeatsForFp(uint32_t fp) const {
     if (fp == 0) return 0;
     for (int i = 0; i < UI_ECHO_SLOTS; i++) if (_echo_fp[i] == fp) return _echo_rep[i];
@@ -572,8 +736,41 @@ public:
     }
     const uint8_t rt = pkt ? pkt->getRouteType() : 0xFF;
     _last_rx_has_scope = (rt == ROUTE_TYPE_TRANSPORT_FLOOD || rt == ROUTE_TYPE_TRANSPORT_DIRECT);
-    _last_rx_scope = (_last_rx_has_scope && pkt) ? pkt->transport_codes[0] : 0;
+    // #157: some senders carry the region in transport_codes[1] (reply-region hint) with
+    // codes[0] zero -- the Info popup then showed "Scope 0000" for a genuinely scoped message.
+    // Show whichever code is set; [0] (the scope proper) wins when both are.
+    _last_rx_scope = 0;
+    _last_rx_scope_home = false;
+    _last_rx_scope_slot = REGION_SLOT_NONE;
+    if (_last_rx_has_scope && pkt) {
+      _last_rx_scope = pkt->transport_codes[0] ? pkt->transport_codes[0] : pkt->transport_codes[1];
+      // The code is HMAC(region key, payload) truncated to 16 bits — per-PACKET,
+      // not a region id, which is why the same sender in the same region shows a
+      // different value on every message (#259). It can still be VERIFIED: recompute
+      // it with our own region key and see if it matches. That answers the only
+      // question a reader actually has ("was this scoped to my region?") and must
+      // happen here, while the packet is still in hand.
+      TransportKey home;
+      memcpy(&home.key, _prefs.default_scope_key, sizeof(home.key));
+      if (!home.isNull() && pkt->transport_codes[0])
+        _last_rx_scope_home = (home.calcTransportCode(pkt) == pkt->transport_codes[0]);
+      // #271: same verification, widened to every region the user has registered,
+      // so the Info popup can name WHICH one instead of only "mine / not mine".
+      // Only codes[0] is the forwarding scope; codes[1] is a reply-region hint and
+      // is reported separately, so match strictly against [0] and never against
+      // the [1] fallback that _last_rx_scope may be holding.
+      _last_rx_scope_slot = pkt->transport_codes[0]
+                              ? _region_reg.matchPacket(pkt, pkt->transport_codes[0])
+                              : REGION_SLOT_NONE;
+    }
   }
+  /** Region registry backing the scope naming above (#271). */
+  RegionRegistry& regionRegistry() { return _region_reg; }
+  /** Stable slot of the region the last RX scope verified against, or
+   *  REGION_SLOT_AMBIGUOUS / REGION_SLOT_NONE. */
+  uint8_t lastRxScopeSlot() const { return _last_rx_scope_slot; }
+  /** True when the last RX flood's scope verified against our own region key. */
+  bool lastRxScopeIsHome() const { return _last_rx_scope_home; }
 
   /** Track a freshly-sent flood TXT fingerprint (called from sendFloodScoped). */
   void uiTrackSentFp(uint32_t fp) {
@@ -711,6 +908,29 @@ public:
     return _ui_sig_probe_tag;
   }
 
+  /** DISCOVER SCAN (Discover app): like uiSendSignalProbe, but asks ALL node types and KEEPS
+   *  every responder (see _discover[] + discoverUpsert, populated in onControlDataRecv). Broadcasts
+   *  one zero-hop NODE_DISCOVER_REQ; neighbours reply DIRECTLY (never floods). type_filter = OR of
+   *  (1<<ADV_TYPE_*); pass 0 for "all types". Returns the scan tag (0 = failed). The caller should
+   *  airtime-gate repeated sweeps (Dispatcher::getRemainingTxBudget). */
+  uint32_t uiStartDiscoverScan(uint8_t type_filter = 0) {
+    uint8_t data[10];
+    data[0] = CTL_TYPE_NODE_DISCOVER_REQ;            // 0x80; low bit prefix_only=0 -> full 32-byte pubkeys
+    data[1] = type_filter ? type_filter
+              : (uint8_t)((1 << ADV_TYPE_CHAT) | (1 << ADV_TYPE_REPEATER) |
+                          (1 << ADV_TYPE_ROOM) | (1 << ADV_TYPE_SENSOR));   // all types
+    getRNG()->random(&data[2], 4);                   // fresh random tag to match this sweep's replies
+    memcpy(&_discover_tag, &data[2], 4);
+    if (_discover_tag == 0) { _discover_tag = 1; memcpy(&data[2], &_discover_tag, 4); }
+    uint32_t since = 0;                               // 0 = answer regardless of freshness
+    memcpy(&data[6], &since, 4);
+    mesh::Packet* pkt = createControlData(data, sizeof(data));
+    if (!pkt) { _discover_tag = 0; return 0; }
+    sendZeroHop(pkt);
+    _discover_scan_ms = millis();
+    return _discover_tag;
+  }
+
   /** Request CayenneLPP telemetry from a remote contact. Reply is delivered
    *  via AbstractUITask::onTelemetryReply with the raw LPP payload after the
    *  4-byte timestamp header. Falls back to onPingReply if the UI didn't
@@ -726,6 +946,38 @@ public:
       _ui_pending_tag  = tag;   // request tag, reflected by the repeater
     }
     return r;
+  }
+
+  /** Ask a directly-heard repeater for the public regions it allows. Region
+   *  discovery is direct-only in MeshCore, so this deliberately sends zero-hop
+   *  and requests a zero-hop reply even when the contact has a saved flood path.
+   *  Unknown discovery hits are installed as transient ADV_TYPE_NONE contacts
+   *  so the encrypted response can be matched and decrypted, but are never
+   *  persisted by getContactForSave(). */
+  int sendRegionsRequestForUI(const uint8_t pub_key[PUB_KEY_SIZE], uint32_t& est_timeout) {
+    if (!pub_key || hasUIRequestPending()) return MSG_SEND_FAILED;
+    ContactInfo* recipient = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+    if (!recipient) {
+      ContactInfo anon = {};
+      memcpy(anon.id.pub_key, pub_key, PUB_KEY_SIZE);
+      anon.type = ADV_TYPE_NONE;
+      anon.out_path_len = 0;
+      if (!addContact(anon)) return MSG_SEND_FAILED;
+      recipient = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+      if (!recipient) return MSG_SEND_FAILED;
+    }
+
+    ContactInfo direct = *recipient;
+    direct.out_path_len = 0;
+    const uint8_t req[] = { 0x01, 0x00 };  // REGIONS + zero-hop reply path
+    uint32_t tag = 0;
+    const int result = sendAnonReq(direct, req, sizeof(req), tag, est_timeout);
+    if (result == MSG_SEND_SENT_DIRECT) {
+      memcpy(&_ui_pending_status, pub_key, 4);
+      _ui_pending_kind = UiReqKind::Regions;
+      _ui_pending_tag = tag;
+    }
+    return result;
   }
 
 private:
@@ -796,6 +1048,17 @@ public:
     return true;
   }
 
+  /** Re-broadcast a contact's advert as a zero-hop packet so nodes in direct
+   *  range can add it. Mirrors the CMD_SHARE_CONTACT serial handler. Zero-hop
+   *  deliberately: flooding a third party's advert spends the whole mesh's
+   *  airtime on a packet nobody asked for. Returns false when the contact isn't
+   *  in the table any more, or the send fails. */
+  bool uiShareContact(const uint8_t pub_key[32]) {
+    ContactInfo* slot = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+    if (!slot) return false;
+    return shareContactZeroHop(*slot);
+  }
+
   /** Update a contact's stored GPS position (microdegrees, *1e6) — e.g. from a
    *  telemetry reply that carried a CayenneLPP GPS field. Lets contacts that
    *  don't flood position adverts (but do answer telemetry) appear on the map
@@ -831,15 +1094,83 @@ public:
     return true;
   }
 
+  /** Add a node found by the Discover app (active NODE_DISCOVER sweep) to contacts, from its full
+   *  32-byte pubkey + node TYPE + a display name. Like uiAddManualContact but preserves the type
+   *  (repeater/room/sensor/chat) so the contact lands with the right role/icon — the discovery
+   *  response carries the type + full pubkey but no advert, so name is a placeholder until one
+   *  arrives. Returns false if it's already a contact, the name is empty, or the table is full. */
+  bool uiAddDiscoveredContact(const uint8_t pub_key[32], uint8_t type, const char* name) {
+    if (!name || !name[0]) return false;
+    if (lookupContactByPubKey(pub_key, PUB_KEY_SIZE) != nullptr) return false;
+    ContactInfo ci{};
+    memcpy(ci.id.pub_key, pub_key, PUB_KEY_SIZE);
+    ci.type         = type;
+    ci.out_path_len = OUT_PATH_UNKNOWN;
+    ci.last_advert_timestamp = 0;          // unknown — we only heard a discovery reply
+    ci.lastmod      = getRTCClock()->getCurrentTime();
+    StrHelper::strncpy(ci.name, name, sizeof(ci.name));
+    if (!addContact(ci)) return false;
+    saveContacts();
+    if (_ui) _ui->onThreadsChanged();
+    return true;
+  }
+
   /** Persist the in-RAM contact table to flash (/contacts3). Public wrapper so
    *  UI paths that insert via the base addContact() — e.g. the Discovered-list
    *  "Add to contacts" button — can persist; otherwise that contact is RAM-only
    *  and lost on reboot. */
   bool uiPersistContacts() { saveContacts(); return true; }
+
+  /** Mirror the device-side favorite star into the firmware contact table's
+   *  flags bit 0 — the bit the core's overwrite-oldest eviction skips and the
+   *  phone app reads/writes. Without this a device-starred contact was still
+   *  evictable when the table filled (#178): the star lived only in
+   *  TouchPrefs, invisible to the core. Returns false if the contact is gone;
+   *  a no-op flag state is success without a save. */
+  // Per-contact telemetry permissions (#266: share position with chosen contacts
+  // instead of broadcasting it in every advert).
+  //
+  // MeshCore packs these into contact.flags ABOVE the favourite bit — the request
+  // handler does `contact.flags >> 1` before masking with TELEM_PERM_* — so the bit
+  // for a given TELEM_PERM_x lives at (x << 1) here. They only take effect for a
+  // category whose telemetry_mode_* is TELEM_MODE_ALLOW_FLAGS; ALLOW_ALL ignores
+  // them and answers everyone, DENY answers nobody.
+  static uint8_t contactTelemBit(uint8_t telem_perm) { return (uint8_t)(telem_perm << 1); }
+
+  bool uiGetContactTelemetryPerm(const uint8_t pub_key[32], uint8_t telem_perm) {
+    ContactInfo* slot = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+    return slot && (slot->flags & contactTelemBit(telem_perm)) != 0;
+  }
+  bool uiSetContactTelemetryPerm(const uint8_t pub_key[32], uint8_t telem_perm, bool on) {
+    ContactInfo* slot = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+    if (!slot) return false;
+    const uint8_t bit = contactTelemBit(telem_perm);
+    const uint8_t nf = on ? (uint8_t)(slot->flags | bit) : (uint8_t)(slot->flags & ~bit);
+    if (nf == slot->flags) return true;
+    slot->flags = nf;
+    saveContacts();
+    return true;
+  }
+
+  bool uiSetContactFavorite(const uint8_t pub_key[32], bool fav) {
+    ContactInfo* slot = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+    if (!slot) return false;
+    const uint8_t nf = fav ? (uint8_t)(slot->flags | 0x01) : (uint8_t)(slot->flags & ~0x01);
+    if (nf == slot->flags) return true;
+    slot->flags = nf;
+    saveContacts();
+    return true;
+  }
   // Flush a pending (possibly coalesced) contacts write before a deliberate
   // shutdown/reboot, so the on-device power paths don't lose the last refresh
   // window on card-less devices (see MyMesh::loop). No-op when nothing is pending.
   void flushContactsIfDirty() { if (dirty_contacts_expiry) { saveContacts(); dirty_contacts_expiry = 0; } }
+  /** Flush the companion sync history (message ring + per-client cursors) to
+   *  storage synchronously. Call on every deliberate reboot/power-off path, next
+   *  to persistHistoryNow(): the periodic writes are coalesced (see
+   *  serviceSyncHistory), so a reset inside the window would otherwise drop the
+   *  newest messages from the app-sync replay. No-op when nothing is pending. */
+  void persistSyncHistoryNow();
 
   /** Remove a contact from a device-UI action and PERSIST it (mirrors the
    *  companion app's CMD_REMOVE_CONTACT). The base removeContact() only drops it
@@ -852,6 +1183,16 @@ public:
     saveContacts();
     if (_ui) _ui->onThreadsChanged();
     return true;
+  }
+
+  /** Drop a contact that a UI scan installed only so an encrypted reply could be
+   *  matched (sendRegionsRequestForUI installs unknown repeaters as ADV_TYPE_NONE).
+   *  Those are never written to flash, so this only frees the RAM slot. Refuses
+   *  anything that is a real contact, whatever the caller passes. */
+  bool removeTransientContact(const uint8_t pub_key[PUB_KEY_SIZE]) {
+    ContactInfo* slot = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+    if (!slot || slot->type != ADV_TYPE_NONE) return false;
+    return removeContact(*slot);
   }
 
   /** Clear channel slot `idx` (zero name + secret), persist, and ping the UI
@@ -891,6 +1232,14 @@ public:
   // To check if there is pending work
   bool hasPendingWork() const;
 
+  /** Return the delay until the next companion retry/final-echo deadline.
+   *  Future retries are wake deadlines, not work that should hold the CPU
+   *  awake. Returns false when no retry train is active. */
+  bool getNextCompanionRetryWakeDelay(uint32_t& delay_millis) const;
+  /** Radio & Mesh toggle: auto-retry sends until the mesh echoes/ACKs them (default ON).
+   *  Live-settable; OFF stops NEW retry trains, an in-flight train finishes its schedule. */
+  void setCompanionRetryEnabled(bool on) { _companion_retry_enabled = on; }
+
   // Number of companion clients currently connected on any transport.
   // Used by the idle light-sleep gate (TouchSleep) to confirm no one is
   // actively talking to us before the node parks in light sleep.
@@ -902,6 +1251,31 @@ public:
   bool isRadioReceiving() const { return _radio && _radio->isReceiving(); }
 
 private:
+  bool _companion_retry_enabled = false;  // opt-in; UITask::begin() applies the persisted toggle
+  uint8_t _flood_path_hash_size_override = 0;  // nonzero only during a synchronous compatibility send
+  uint8_t floodPathHashSize() const {
+    return _flood_path_hash_size_override
+        ? _flood_path_hash_size_override
+        : (uint8_t)(_prefs.path_hash_mode + 1);
+  }
+  static const uint8_t COMPANION_TEXT_QUEUE_CAPACITY = 16;
+  uint8_t companionDetachQueuedText(mesh::Packet* packets[], uint8_t priorities[],
+                                    uint32_t scheduled_for[]);
+  bool companionRestoreQueuedText(mesh::Packet* packets[], const uint8_t priorities[],
+                                  const uint32_t scheduled_for[], uint8_t count);
+  mesh::Packet* companionDetachQueuedTextByHash4(uint32_t packet_hash4,
+                                                 uint8_t retry_key[MAX_HASH_SIZE]);
+  void companionRetryCancelKey(const uint8_t retry_key[MAX_HASH_SIZE]);
+
+  void companionRetryObserveRaw(const uint8_t raw[], int len);
+  void companionRetryStart(const mesh::Packet* packet, const uint8_t retry_key[MAX_HASH_SIZE]);
+  void companionRetryService();
+  void companionRetryCancelSlot(int slot_idx);
+  void companionRetryResetSlot(int slot_idx);
+  bool companionRetryQueueClone(int slot_idx, const mesh::Packet* packet,
+                                uint8_t attempt_idx);
+  uint32_t companionRetryDelay(const mesh::Packet* packet, bool direct, uint8_t attempt_idx);
+
   void writeOKFrame();
   void writeErrFrame(uint8_t err_code);
   void writeDisabledFrame();
@@ -927,7 +1301,29 @@ private:
   int getBlobByKey(const uint8_t key[], int key_len, uint8_t dest_buf[]) override { 
     return _store->getBlobByKey(key, key_len, dest_buf);
   }
+  // The core calls this on EVERY received advert (BaseChatMesh::onAdvertRecv, outside the
+  // auto-add block, so for known contacts too) and each call is a full create+truncate+write
+  // of a small file. On a card-less board that file lives on SPIFFS, so ~200 known nodes
+  // re-advertising means a flash write every few seconds forever — churn that keeps the
+  // partition permanently GC-prone and feeds the multi-second "mesh" loop stalls.
+  //
+  // The blob is the raw advert packet and its ONLY consumer is Share/export contact
+  // (BaseChatMesh::shareContact via getBlobByKey). Its content for a given node is
+  // effectively static — name, type, location. So persist it ONCE PER KEY PER BOOT and skip
+  // the redundant rewrites: after the first advert from each node the packet path does no
+  // flash I/O at all. Reads are unaffected because getBlobByKey above still reads the file we
+  // already wrote, so there is no cache to keep coherent. A node that RENAMES itself keeps its
+  // old shared blob until the next reboot, which is a fair price for removing the churn.
+  // Cost: kBlobSeenSlots * 4 bytes of DRAM. Move to PSRAM if static DRAM ever gets tight.
   bool putBlobByKey(const uint8_t key[], int key_len, const uint8_t src_buf[], int len) override {
+    if (key_len >= 4) {
+      uint32_t pfx;
+      memcpy(&pfx, key, 4);
+      if (pfx == 0) pfx = 1;   // 0 is the empty-slot marker
+      const uint16_t slot = (uint16_t)((pfx ^ (pfx >> 13) ^ (pfx >> 23)) & (kBlobSeenSlots - 1));
+      if (_blob_seen[slot] == pfx) return true;   // already on flash this boot — skip the write
+      _blob_seen[slot] = pfx;                    // collision just costs one extra write later
+    }
     return _store->putBlobByKey(key, key_len, src_buf, len);
   }
 
@@ -978,7 +1374,19 @@ private:
   bool _cli_rescue;
   bool send_unscoped;   // force un-scoped flood (instead of using send_scope)
   bool scope_direct_floods = false;  // opt-in (#64): tag direct/login/admin floods with the default region scope
-  char cli_command[80];
+  // 200 not 80: the serial sideload ("fadd ...", see cliPutChunk) carries up
+  // to ~130 chars per line; every other command is far shorter.
+  char cli_command[200];
+#if defined(ESP32)
+  // Serial sideload state ("fput" / "fadd" / "fend"): the file being written.
+  File _cli_put;
+  uint32_t _cli_put_len = 0;
+  uint32_t _cli_put_last_len = 0;
+  bool _cli_put_ended = false;
+  void cliPutBegin(const char* path);
+  void cliPutChunk(const char* args);
+  void cliPutEnd();
+#endif
   uint8_t app_target_ver;
   uint8_t *sign_data;
   uint32_t sign_data_len;
@@ -990,6 +1398,14 @@ private:
   // the first save. Kept in sync by every MyMesh::saveContacts() call.
   int      _last_saved_contacts_n = -1;
   uint32_t _next_contacts_refresh_save = 0;
+  // Separate, much SHORTER floor for saves caused by an add/remove. Those used to bypass the
+  // refresh window completely, so on a growing mesh every newly-heard node forced its own full
+  // rewrite. See CONTACTS_ADD_SAVE_MIN_INTERVAL.
+  uint32_t _next_contacts_add_save = 0;
+  // Pubkey prefixes whose advert blob has already been persisted this boot — see
+  // putBlobByKey. Sized above a full contact list so the common case never thrashes.
+  static const uint16_t kBlobSeenSlots = 512;   // power of two (mask), 2 KB total
+  uint32_t _blob_seen[kBlobSeenSlots] = {0};
 
   TransportKey send_scope;
   TransportKey _chan_scope_saved;             // push/popChannelScope stash
@@ -1030,20 +1446,82 @@ private:
   uint32_t history_next_seq;
   ClientHistoryState history_clients[MAX_HISTORY_CLIENTS];
   int history_num_clients;
+
+  // Companion sync-history persistence. The ring above is what CMD_SYNC_NEXT_MESSAGE /
+  // SyncSince replay to an app that (re)connects — and it used to be RAM-only, so any
+  // power cycle emptied it: an app that was not connected while messages arrived never
+  // got them after the reboot, while the on-device chat store (UITask) still showed them.
+  // Worst on boards whose only "off" is a hard power cut (ThinkNode M9 slider), but the
+  // V4/T-Deck power menus deep-sleep (RAM lost) just the same.
+  //   /synchist  append-only log of the sync-relevant frames (seq + raw frame); small
+  //              per-message appends, compacted (tmp + swap) once it holds > 2x the ring.
+  //   /synccur   next_seq + per-client last_delivered_seq (tiny, tmp + swap) so a
+  //              returning client resumes where it left off instead of re-receiving
+  //              everything. Both live on DataStore::getHotDataFS() (SD when routed).
+  bool     _synchist_log_dirty = false;    // ring entries appended since the last log write
+  bool     _synchist_cur_dirty = false;    // client cursors / next_seq changed since last write
+  bool     _synchist_need_compact = false; // torn/oversized log: rewrite from the ring instead of appending
+  int      _synchist_unflushed = 0;        // newest N ring entries not yet in the log
+  uint32_t _synchist_file_recs = 0;        // records currently in /synchist
+  unsigned long _synchist_log_due = 0, _synchist_log_first = 0;   // coalesce deadline / first-dirty time
+  unsigned long _synchist_cur_due = 0, _synchist_cur_first = 0;
+  bool     _synchist_was_connected = false; // disconnect edge -> flush cursors now
+  static bool isSyncMessageCode(uint8_t code);
+  void markSyncLogDirty();
+  void markSyncCursorsDirty();
+  void loadSyncHistory();      // MyMesh::begin(): restore ring + cursors from storage
+  bool appendSyncLog();        // land the newest _synchist_unflushed ring entries
+  bool compactSyncLog();       // rewrite the whole ring (tmp + swap)
+  bool saveSyncCursors();      // /synccur (tmp + swap)
+  void serviceSyncHistory();   // MyMesh::loop(): coalesced flushes
   ClientProtoState proto_clients[MAX_HISTORY_CLIENTS];
   int proto_num_clients;
 
   struct AckTableEntry {
-    unsigned long msg_sent;
-    uint32_t ack;
-    ContactInfo* contact;
+    unsigned long msg_sent = 0;
+    uint32_t ack = 0;
+    ContactInfo* contact = nullptr;
+    uint8_t text_fingerprint[MAX_HASH_SIZE] = {};
+    uint8_t retry_key[MAX_HASH_SIZE] = {};
   };
   #define EXPECTED_ACK_TABLE_SIZE 8
   AckTableEntry expected_ack_table[EXPECTED_ACK_TABLE_SIZE]; // circular table
   int next_ack_idx;
+  AckTableEntry* findPendingTextMessage(const uint8_t text_fingerprint[MAX_HASH_SIZE]);
+  void clearExpectedAck(AckTableEntry& entry, bool cancel_retry);
+
+  uint32_t _last_plain_tx_ack = 0;
+  uint8_t _last_plain_tx_fingerprint[MAX_HASH_SIZE] = {};
+  uint8_t _last_plain_tx_retry_key[MAX_HASH_SIZE] = {};
+  bool _last_plain_tx_meta_valid = false;
 
   #define ADVERT_PATH_TABLE_SIZE   16
   AdvertPath advert_paths[ADVERT_PATH_TABLE_SIZE]; // circular table
+  uint32_t advert_recv_seq = 0;
+#if defined(ESP32)
+  portMUX_TYPE advert_paths_mux = portMUX_INITIALIZER_UNLOCKED;
+#endif
+
+  // Client-side retry-until-echo state. Only one exact packet clone is retained
+  // in the outbound queue per active slot, matching the companion behavior.
+  static const uint8_t COMPANION_RETRY_SLOTS = 6;
+  struct CompanionRetrySlot {
+    mesh::Packet* queued_packet = nullptr;
+    uint32_t retry_at = 0;
+    uint32_t retry_delay = 0;
+    uint32_t missing_since = 0;
+    uint8_t retry_key[MAX_HASH_SIZE] = {};
+    uint8_t attempts_sent = 0;
+    uint8_t max_attempts = 0;
+    uint8_t priority = 0;
+    uint8_t progress_marker = 0;
+    uint8_t payload_type = 0;
+    bool direct = false;
+    bool waiting_final_echo = false;
+    bool active = false;
+  };
+  CompanionRetrySlot _companion_retries[COMPANION_RETRY_SLOTS];
+  uint8_t _active_companion_retries = 0;
 
   // One-shot auto-advert on boot. Recipients with auto-add ON pick up our
   // current pubkey, which is critical when the touch firmware regenerates

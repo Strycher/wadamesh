@@ -17,7 +17,7 @@
 #include <SD_MMC.h>          // microSD (slot 0): reliable store for contacts/channels/chat (internal FFat loses them on this P4)
 #include "esp_partition.h"   // enumerate partitions (AppFS apps boot fresh — verify locfd is visible)
 #include <WiFi.h>
-#include <helpers/esp32/MultiTransportCompanionInterface.h>
+#include "../../src/helpers/esp32/MultiTransportCompanionInterface.h"
 #include <helpers/esp32/WifiRuntimeStore.h>
 #include <helpers/esp32/TouchPrefsStore.h>
 #include "esp32-hal-hosted.h"   // arduino's esp-hosted bring-up (shared by LoRa + WiFi on the C6)
@@ -379,7 +379,11 @@ static void wadameshSetup() {
   // the build (-Og "worked by luck"; -Os made the exists()-gated identity + prefs loads come up
   // empty: fresh node identity, default name, profile changes lost every reboot). The card's FAT
   // metadata is truthful, so the WHOLE store lives there now; FFat remains only the no-card fallback.
-  g_sd_ok = SD_MMC.begin("/sdcard", false /*1-bit*/) && SD_MMC.cardType() != CARD_NONE;
+  sdMountDiagBegin();
+  const bool sd_begin_ok = SD_MMC.begin("/sdcard", false /*1-bit*/);
+  g_sd_ok = sd_begin_ok && SD_MMC.cardType() != CARD_NONE;
+  sdMountDiagAttempt((uint32_t)SDMMC_FREQ_DEFAULT * 1000u, sd_begin_ok, g_sd_ok);
+  sdMountDiagSetMounted(g_sd_ok, g_sd_ok ? (uint32_t)SDMMC_FREQ_DEFAULT * 1000u : 0);
   printf("[storage] SD_MMC.begin = %s\n", g_sd_ok ? "OK" : "no card");
   if (g_sd_ok) {
     SD_MMC.mkdir("/meshcomod");
@@ -475,7 +479,14 @@ extern "C" void app_main(void) {
     ui_task.loop();      // UI first (splash/flush)
 
     bool wifi_radio_en = wifiConfigWantsWifi();
-    if (!wifi_radio_inited) { wifi_radio_inited = true; wifi_radio_prev = wifi_radio_en; }
+    // Apply the radio pref on the first pass instead of only recording it: with
+    // Wi-Fi off there is never an on->off transition for the branch below to
+    // catch, so anything the coprocessor joined on its own survives boot (#373).
+    if (!wifi_radio_inited) {
+      wifi_radio_inited = true;
+      wifi_radio_prev   = wifi_radio_en;
+      if (!wifi_radio_en) { WiFi.disconnect(true); delay(50); WiFi.mode(WIFI_OFF); }
+    }
     else if (wifi_radio_en != wifi_radio_prev) {
       wifi_radio_prev = wifi_radio_en;
       if (!wifi_radio_en) { WiFi.disconnect(true); delay(50); WiFi.mode(WIFI_OFF); }

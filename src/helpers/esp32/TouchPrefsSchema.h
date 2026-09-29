@@ -1,0 +1,237 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+namespace TouchPrefsSchema {
+
+static constexpr uint16_t MAGIC = 0x5743;   // 'WC' (WadaCfg)
+static constexpr uint8_t CURRENT_VERSION = 65;   // v49: fem_lna default flip on the V4-R8; v50: map tile z/x/y line off by default (no new fields); v51: console_mode (boot into the text console; new trailing field, default OFF); v52: console_monitor (show incoming messages in the console, default ON); v54: boot_wifi_time + boot_wifi_open (cold-boot saved-Wi-Fi time sync, #383; both OFF); v55: loud_alerts (resonant-pitch chime, #388; OFF); v56: theme_mode (Night/Day, with high-contrast variants, #296/#544; default Night); v57: gps_fuzz_m (displace the advertised position, #399; 0 = off); v58: Attaky notification blink enable + room/DM color indexes (#423); v59: telem_loc_exact (answer position requests from chosen contacts with the REAL fix instead of the advert displacement; 0 = keep it displaced); v60: home_key_keeps_drawer (#491; default OFF); v61: ble_kbd_* (Bluetooth serves a keyboard instead of the phone app, its layout and the paired keyboard; default phone app); v62: ble_kbd_back (a second key that acts as Back; 0 = only Esc); v63: V4-R8 ui_scale reset before exposing font-only presets (#536); v64: report_ping + report_done_n (beta test reports: the opt-in install count and the tag this device already reported on; both default 0); v65: ThinkNode M9 ui_scale reset before exposing font-only presets, the same one-time correction v63 made for the V4-R8 (no new field)
+static constexpr uint8_t BROKEN_MID_INSERT_VERSION = 44;
+
+// Persisted byte layout. New fields must be appended at the end: older blobs
+// are overlaid on a default-initialised current Config during migration.
+struct __attribute__((packed)) Config {
+  uint16_t magic;
+  uint8_t  ver;
+  uint8_t  bright;
+  uint8_t  kb_bl;
+  uint8_t  kb_layout;
+  uint8_t  kb_secondary;
+  uint8_t  ui_lang;
+  uint8_t  ui_rotation;
+  uint8_t  dc_show;
+  uint8_t  use_miles;
+  uint8_t  tiles_from_sd;
+  uint8_t  clr_bubbles;
+  uint8_t  kb_accent;
+  int8_t   time_offs;
+  uint16_t scr_to_s;
+  uint16_t kb_enabled;
+  uint16_t batt_full_mv;
+  uint32_t lock_color;
+  uint32_t accent;
+  uint32_t gps_baud;
+  uint8_t  sig_probe_en;
+  uint16_t sig_poll_min;
+  uint8_t  tz_zone;
+  uint8_t  hide_node_name;
+  uint8_t  map_night;
+  uint8_t  map_zoom;
+  uint8_t  map_show_coords;
+  uint8_t  map_show_tilexyz;
+  uint8_t  map_show_contacts;
+  uint8_t  app_grid_large;
+  uint8_t  ui_scale;
+  uint8_t  kbd_nav;
+  uint8_t  sleep_idle;
+  uint8_t  nav_keys[5];
+  uint8_t  map_zoom_buttons;
+  uint8_t  nav_dir_keys[6];
+  uint8_t  home_is_drawer;
+  uint8_t  nav_scroll_keys[2];
+  uint8_t  notify_new_contact;
+  uint8_t  show_sensors_tab;
+  uint8_t  map_show_links;
+  uint8_t  map_style;
+  uint8_t  tb_nav;
+  uint8_t  scope_direct;
+  uint8_t  fem_lna;
+  uint8_t  msg_flash;
+  uint8_t  flood_adv_hrs;
+  uint16_t local_adv_min;
+  uint8_t  beta_updates;
+  uint8_t  boot_advert;
+  uint8_t  compact_chat;
+  uint32_t clock_floor;
+  uint8_t  rx_queue;
+  uint8_t  web_mirror;
+  uint8_t  remote_mode;
+  uint8_t  remote_landscape;
+  uint8_t  web_terminal;
+  uint8_t  map_tile_debug;
+  uint8_t  hist_sync_after;
+  uint16_t hist_per_chat;
+  uint8_t  p4_antenna;
+  uint8_t  retry_echo;       // v45: actual trailing location; v44 inserted it before web_mirror
+  uint32_t app_hide;         // v46: app-drawer hide bitmask (Store page "built-in" toggles)
+  char     lang_file[12];    // v48: file-language code ("" = built-in ui_lang; file at <data>/lang/<code>.lang)
+  // NEW FIELDS GO HERE, AT THE TAIL. v44 inserted one mid-struct and shifted
+  // every field after it, which is what v45 had to undo. Append, never insert.
+  uint8_t  console_mode;     // v51: boot into the LVGL-free text console (CONSOLE_MODE.md)
+  uint8_t  console_monitor;  // v52: console mode shows incoming messages as they arrive
+  // v53: never probe for the raw keyboard protocol, always use the older one.
+  // The detection cannot be certain while nobody is typing, and when it guesses
+  // wrong the keyboard types nonsense -- which also makes it very hard to reach
+  // a setting to fix it. This is reachable by touch, so it is a way out that
+  // does not need the keyboard that is broken (#341, #351).
+  uint8_t  kb_force_legacy;
+  // v54 (#383): cold-boot time acquisition over SAVED Wi-Fi, for boards that
+  // cannot keep wall time through a power cut. Two independent opt-ins, both
+  // default OFF so boot time and radio behaviour are unchanged for everyone who
+  // does not ask for this. See helpers/esp32/BootTimeSync.h for why the second
+  // one is separate: joining an OPEN access point is a materially different
+  // trust decision from reconnecting to a saved secured one.
+  uint8_t  boot_wifi_time;   // sync the clock from a saved Wi-Fi network after a cold boot
+  uint8_t  boot_wifi_open;   // ...and allow saved OPEN networks to be used for it
+  // A bare piezo on a GPIO has no amplitude control -- tone() is a fixed-duty
+  // square wave -- so the only lever on loudness is frequency: a piezo is far
+  // louder near its mechanical resonance, typically around 4 kHz, than at the
+  // 1-2.6 kHz the chime uses. This shifts the same chime up into that band (#388).
+  uint8_t  loud_alerts;      // play the notification chime at the piezo's resonant pitch
+  uint8_t  theme_mode;       // v56: 0 Night, 1 Day, 2 Day HC, 3 Night HC (#544)
+  // v57 (#399): displace the position put in our OWN adverts, in metres, 0 = off.
+  // Privacy, for people who want to advertise a position without advertising
+  // their address. The displacement is FIXED per device, never re-rolled per
+  // advert: a fresh random offset each time would let anyone averaging a night
+  // of adverts recover the true centre, which is the opposite of the intent.
+  uint16_t gps_fuzz_m;
+  uint8_t  attaky_notify_enabled;    // v58: blink both keyboard indicators for incoming messages
+  uint8_t  attaky_notify_room_color; // v58: seven-color palette index for rooms/channels
+  uint8_t  attaky_notify_dm_color;   // v58: seven-color palette index for direct messages
+  // v59: a telemetry position answer is a DELIBERATE, encrypted reply to one contact
+  // you already picked, not a broadcast, so applying the advert displacement to it is
+  // arguably too blunt (honza_87628). OFF keeps the displacement, matching the advert.
+  uint8_t  telem_loc_exact;
+  uint8_t  home_key_keeps_drawer; // v60: M9 Home key stays in/returns to the app drawer
+  // v61: an external Bluetooth LE keyboard. Bluetooth serves either the phone app
+  // (0) or the keyboard (1). The layout decodes the keyboard's key positions
+  // (BleKbd::Layout). An all-zero address means no keyboard is paired.
+  uint8_t  ble_kbd_mode;
+  uint8_t  ble_kbd_layout;
+  uint8_t  ble_kbd_addr[6];
+  uint8_t  ble_kbd_addr_type;
+  char     ble_kbd_name[32];
+  // v62: the HID usage of a key that acts as Back besides Esc, for keyboards
+  // whose Esc key sends something else. 0 = none.
+  uint8_t  ble_kbd_back;
+  // v64: beta test reports (see deploy/report-service.py). report_ping opts into
+  // the anonymous "this device is running beta_N" count that gives the test
+  // matrix a denominator, and is OFF until somebody turns it on: the count is
+  // telemetry, however thin, and this project promises none by default.
+  // report_done_n is the beta number this device has already reported on, so the
+  // page can say so rather than asking twice.
+  uint8_t  report_ping;
+  uint16_t report_done_n;
+};
+
+static constexpr size_t HEADER_SIZE = offsetof(Config, bright);
+static constexpr size_t STABLE_V44_PREFIX_SIZE = offsetof(Config, web_mirror);
+
+static_assert(offsetof(Config, web_mirror) == offsetof(Config, rx_queue) + sizeof(Config::rx_queue),
+              "the pre-v44 suffix moved");
+// The whole struct is persisted as ONE blob (cfgFlush -> SdNvsPrefs::putBytes).
+// On the file-backed path that store rejects any value over 2048 bytes, and the
+// rejection is silent: cfgFlush just returns false and every preference stops
+// persisting, with nothing in the log to say why. The struct grows most releases,
+// so guard the ceiling here rather than discover it as "settings do not save" on
+// whichever board is using the file backend. 163 bytes today.
+static_assert(sizeof(Config) <= 2048,
+              "Config exceeds the SdNvsPrefs value cap; prefs would silently stop saving");
+static_assert(offsetof(Config, report_done_n) + sizeof(Config::report_done_n) == sizeof(Config),
+              "new preference fields must remain trailing");
+// lang_file must stay immediately before the tail, or a v48-era blob overlays
+// onto the wrong bytes. Checking both ends means the next person to append is
+// told at compile time instead of shipping another v44.
+static_assert(offsetof(Config, console_mode) ==
+                  offsetof(Config, lang_file) + sizeof(Config::lang_file),
+              "console_mode must follow lang_file");
+static_assert(offsetof(Config, console_monitor) ==
+                  offsetof(Config, console_mode) + sizeof(Config::console_mode),
+              "console_monitor must follow console_mode");
+static_assert(offsetof(Config, kb_force_legacy) ==
+                  offsetof(Config, console_monitor) + sizeof(Config::console_monitor),
+              "kb_force_legacy must follow console_monitor");
+static_assert(offsetof(Config, boot_wifi_time) ==
+                  offsetof(Config, kb_force_legacy) + sizeof(Config::kb_force_legacy),
+              "boot_wifi_time must follow kb_force_legacy");
+static_assert(offsetof(Config, boot_wifi_open) ==
+                  offsetof(Config, boot_wifi_time) + sizeof(Config::boot_wifi_time),
+              "boot_wifi_open must follow boot_wifi_time");
+static_assert(offsetof(Config, theme_mode) ==
+                  offsetof(Config, loud_alerts) + sizeof(Config::loud_alerts),
+              "theme_mode must follow loud_alerts");
+static_assert(offsetof(Config, gps_fuzz_m) ==
+                  offsetof(Config, theme_mode) + sizeof(Config::theme_mode),
+              "gps_fuzz_m must follow theme_mode");
+static_assert(offsetof(Config, attaky_notify_enabled) ==
+          offsetof(Config, gps_fuzz_m) + sizeof(Config::gps_fuzz_m),
+        "attaky_notify_enabled must follow gps_fuzz_m");
+static_assert(offsetof(Config, attaky_notify_room_color) ==
+          offsetof(Config, attaky_notify_enabled) + sizeof(Config::attaky_notify_enabled),
+        "attaky_notify_room_color must follow attaky_notify_enabled");
+static_assert(offsetof(Config, attaky_notify_dm_color) ==
+          offsetof(Config, attaky_notify_room_color) + sizeof(Config::attaky_notify_room_color),
+        "attaky_notify_dm_color must follow attaky_notify_room_color");
+static_assert(offsetof(Config, telem_loc_exact) ==
+          offsetof(Config, attaky_notify_dm_color) + sizeof(Config::attaky_notify_dm_color),
+        "telem_loc_exact must follow attaky_notify_dm_color");
+static_assert(offsetof(Config, home_key_keeps_drawer) ==
+          offsetof(Config, telem_loc_exact) + sizeof(Config::telem_loc_exact),
+        "home_key_keeps_drawer must follow telem_loc_exact");
+static_assert(offsetof(Config, ble_kbd_mode) ==
+          offsetof(Config, home_key_keeps_drawer) + sizeof(Config::home_key_keeps_drawer),
+        "ble_kbd_mode must follow home_key_keeps_drawer");
+static_assert(offsetof(Config, ble_kbd_layout) ==
+          offsetof(Config, ble_kbd_mode) + sizeof(Config::ble_kbd_mode),
+        "ble_kbd_layout must follow ble_kbd_mode");
+static_assert(offsetof(Config, ble_kbd_addr) ==
+          offsetof(Config, ble_kbd_layout) + sizeof(Config::ble_kbd_layout),
+        "ble_kbd_addr must follow ble_kbd_layout");
+static_assert(offsetof(Config, ble_kbd_addr_type) ==
+          offsetof(Config, ble_kbd_addr) + sizeof(Config::ble_kbd_addr),
+        "ble_kbd_addr_type must follow ble_kbd_addr");
+static_assert(offsetof(Config, ble_kbd_name) ==
+          offsetof(Config, ble_kbd_addr_type) + sizeof(Config::ble_kbd_addr_type),
+        "ble_kbd_name must follow ble_kbd_addr_type");
+static_assert(offsetof(Config, ble_kbd_back) ==
+          offsetof(Config, ble_kbd_name) + sizeof(Config::ble_kbd_name),
+        "ble_kbd_back must follow ble_kbd_name");
+
+// Overlay a persisted blob on caller-provided defaults. Beta 57 wrote v44 with
+// retry_echo inserted before web_mirror, shifting every later value. That blob
+// cannot be distinguished from a fresh v44 blob, and the original web_mirror
+// byte was overwritten during migration, so preserve only the unambiguous
+// prefix through rx_queue and leave the whole suffix at safe defaults.
+inline bool overlayStored(Config& current, const void* blob, size_t size,
+                          uint8_t* stored_version = nullptr) {
+  if (!blob || size < HEADER_SIZE) return false;
+  const uint8_t* bytes = static_cast<const uint8_t*>(blob);
+  uint16_t magic = 0;
+  memcpy(&magic, bytes, sizeof(magic));
+  if (magic != MAGIC) return false;
+
+  const uint8_t version = bytes[offsetof(Config, ver)];
+  if (stored_version) *stored_version = version;
+
+  size_t copy_size = size < sizeof(Config) ? size : sizeof(Config);
+  if (version == BROKEN_MID_INSERT_VERSION && copy_size > STABLE_V44_PREFIX_SIZE)
+    copy_size = STABLE_V44_PREFIX_SIZE;
+  memcpy(&current, blob, copy_size);
+  return true;
+}
+
+}  // namespace TouchPrefsSchema

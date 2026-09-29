@@ -9,12 +9,42 @@
 #include <stdint.h>
 #include <stddef.h>   // size_t (blob helpers below)
 
+static constexpr uint8_t TOUCH_THEME_NIGHT = 0;
+static constexpr uint8_t TOUCH_THEME_DAY   = 1;
+static constexpr uint8_t TOUCH_THEME_DAY_HIGH_CONTRAST = 2;
+static constexpr uint8_t TOUCH_THEME_NIGHT_HIGH_CONTRAST = 3;
+
 void touchPrefsBegin();
 // Force a fresh load of the settings blob. Call after SdNvsPrefs::useFile() at
 // boot: an earlier pref read may have cached the blob from the legacy backend.
 void touchPrefsReload();
+// Drive/force the deferred file-backed snapshot writer without exposing the
+// vendored core's stale SdNvsPrefs header to UI translation units.
+void touchPrefsTick(uint32_t now_ms);
+bool touchPrefsFlush(uint32_t timeout_ms = 12000);
+bool touchPrefsIoBusy();
 
-/** Screen timeout in seconds; 0 = never sleep. Default 20. */
+/** Discrete screen-timeout stops used by storage and the settings slider. */
+static constexpr uint16_t TOUCH_SCREEN_TIMEOUT_SECS[] = {
+  30, 60, 120, 300, 600, 900, 1800, 3600, 0
+};
+static constexpr uint8_t TOUCH_SCREEN_TIMEOUT_COUNT =
+    sizeof(TOUCH_SCREEN_TIMEOUT_SECS) / sizeof(TOUCH_SCREEN_TIMEOUT_SECS[0]);
+
+/** Return the nearest timeout stop; ties round upward. Zero always means Never. */
+static inline uint8_t touchPrefsScreenTimeoutIndex(uint16_t seconds) {
+  if (seconds == 0) return TOUCH_SCREEN_TIMEOUT_COUNT - 1;
+  uint8_t best = 0;
+  uint32_t best_delta = UINT32_MAX;
+  for (uint8_t i = 0; i + 1 < TOUCH_SCREEN_TIMEOUT_COUNT; ++i) {
+    const uint16_t option = TOUCH_SCREEN_TIMEOUT_SECS[i];
+    const uint32_t delta = seconds > option ? seconds - option : option - seconds;
+    if (delta <= best_delta) { best = i; best_delta = delta; }
+  }
+  return best;
+}
+
+/** Screen timeout in seconds; 0 = never sleep. Default 30 seconds. */
 uint16_t touchPrefsGetScreenTimeoutSecs();
 bool touchPrefsSetScreenTimeoutSecs(uint16_t seconds);
 
@@ -22,7 +52,11 @@ bool touchPrefsSetScreenTimeoutSecs(uint16_t seconds);
 uint8_t touchPrefsGetBrightness();
 bool    touchPrefsSetBrightness(uint8_t pct);
 
-/** Keyboard backlight mode: 0 = off, 1 = on, 2 = auto (on while typing). Default auto. */
+/** Firmware palette: Night/Day, each standard or High contrast. Applied after restart. */
+uint8_t touchPrefsGetThemeMode();
+bool    touchPrefsSetThemeMode(uint8_t mode);
+
+/** Keyboard backlight mode: 0 = off, 1 = on, 2 = auto (on after activity until the screen timeout). Default auto. */
 uint8_t touchPrefsGetKbBacklight();
 bool    touchPrefsSetKbBacklight(uint8_t mode);
 
@@ -70,14 +104,18 @@ bool touchPrefsSetWebTerminal(bool on);
 /** UI language index (UiLang enum in i18n.h; 0 = English). Read at boot. */
 uint8_t touchPrefsGetUiLang();
 bool    touchPrefsSetUiLang(uint8_t lang);
+/** File-language code ("" = none). When set, translations load at boot from
+ *  <data>/lang/<code>.lang and overlay the built-in table (ui_lang = fallback). */
+void    touchPrefsGetLangFile(char* out, size_t cap);
+bool    touchPrefsSetLangFile(const char* code);
 
 /** User-configurable quick-reply macros: up to 6 short strings the user can
  *  drop into the composer with a single tap (e.g. "ok", "on the way",
- *  "stuck — wait"). idx is 0..5; max length 31 chars + null. Returns the
+ *  "stuck — wait"). idx is 0..5; max length 100 chars + null. Returns the
  *  text length actually written into `out` (0 if the slot is empty or idx
  *  is out of range). `out` is always null-terminated when out_cap > 0. */
 constexpr int TOUCH_QUICK_REPLY_COUNT  = 6;
-constexpr int TOUCH_QUICK_REPLY_MAXLEN = 32;
+constexpr int TOUCH_QUICK_REPLY_MAXLEN = 101;
 int  touchPrefsGetQuickReply(int idx, char* out, int out_cap);
 bool touchPrefsSetQuickReply(int idx, const char* text);
 
@@ -94,7 +132,7 @@ bool touchPrefsGetUseMiles();
 bool touchPrefsSetUseMiles(bool use_miles);
 
 /** Map tile source: false = tile server + on-device cache (default), true = read tiles off the
- *  microSD card (/tiles/<z>/<x>/<y>.jpg). T-Deck only (the V4 TFT has no SD slot). */
+ *  microSD card (/tiles/<z>/<x>/<y>.jpg). Supported and persisted on T-Deck and T-Pager. */
 bool touchPrefsGetTilesFromSd();
 bool touchPrefsSetTilesFromSd(bool from_sd);
 
@@ -102,6 +140,18 @@ bool touchPrefsSetTilesFromSd(bool from_sd);
  *  Default false. */
 bool touchPrefsGetMapNight();
 bool touchPrefsSetMapNight(bool on);
+
+// Chat-history flush: consecutive failed off-thread (background) writes before
+// the flush falls back to the blocking loop-task write (reliable, but the UI
+// hitches for the write's duration). 0 = never fall back. Default 2.
+uint8_t touchPrefsGetHistSyncAfter();
+bool    touchPrefsSetHistSyncAfter(uint8_t n);
+
+/** Max stored messages kept per chat; 0 = no per-chat cap. Default 250.
+ *  Without a cap one busy channel can fill the whole shared ring, starving every other
+ *  chat of history and slowing the UI down as the ring fills. */
+uint16_t touchPrefsGetHistPerChat();
+bool     touchPrefsSetHistPerChat(uint16_t n);
 
 /** Last map zoom level, persisted so the map reopens where the user left it.
  *  0 = unset (let the auto-snap pick a level for the available tile pack). */
@@ -134,8 +184,9 @@ bool touchPrefsSetAppGridLarge(bool on);
 bool touchPrefsGetSleepIdle();
 bool touchPrefsSetSleepIdle(bool on);
 
-/* UI resolution scale (Tanmatsu): 0=100% (native 800x480), 1=150%, 2=200%. Applied at boot —
- * LVGL renders at a lower resolution and the flush upscales to the panel. Reboot to apply. */
+/* UI-size preset. Large-screen boards retain their 0..2 percentage mapping;
+ * V4-R8 uses 0..2 font-only presets, and T-Pager uses four 0..3 semantic font
+ * presets. Reboot to apply. */
 uint8_t touchPrefsGetUiScale();
 bool    touchPrefsSetUiScale(uint8_t scale);
 
@@ -168,8 +219,44 @@ bool    touchPrefsSetFemLna(bool on);
 bool    touchPrefsGetMsgFlash();
 bool    touchPrefsSetMsgFlash(bool on);
 
+static constexpr uint8_t TOUCH_ATTAKY_NOTIFY_COLOR_COUNT = 7;
+bool    touchPrefsGetAttakyNotifyEnabled();
+bool    touchPrefsSetAttakyNotifyEnabled(bool on);
+uint8_t touchPrefsGetAttakyNotifyRoomColor();
+bool    touchPrefsSetAttakyNotifyRoomColor(uint8_t color);
+uint8_t touchPrefsGetAttakyNotifyDmColor();
+bool    touchPrefsSetAttakyNotifyDmColor(uint8_t color);
+
 /* Advertise on boot (#76): fire one flood self-advert ~6s after boot so peers with auto-add on
  * refresh our pubkey (useful after a reflash wiped storage). Opt-in, default off. All boards. */
+bool    touchPrefsGetConsoleMode();   // boot into the LVGL-free console (CONSOLE_MODE.md)
+bool    touchPrefsSetConsoleMode(bool on);
+// Skip raw-protocol detection on the T-Deck keyboard and always use the older
+// one. Reachable by touch, so it is a way out when a misdetection has left the
+// keyboard typing nonsense (#341, #351).
+bool    touchPrefsGetKbForceLegacy();
+bool    touchPrefsSetKbForceLegacy(bool on);
+bool    touchPrefsGetConsoleMonitor();      // console: show incoming messages live
+bool    touchPrefsSetConsoleMonitor(bool on);
+
+/** Cold-boot clock acquisition over SAVED Wi-Fi (#383, helpers/esp32/BootTimeSync.h).
+ *  Both default OFF. The first enables the bounded, power-on-only session at all;
+ *  the second additionally permits saved OPEN networks, which is a separate trust
+ *  decision and is never implied by the first. */
+bool    touchPrefsGetBootWifiTime();
+bool    touchPrefsSetBootWifiTime(bool on);
+uint16_t touchPrefsGetGpsFuzzM();
+bool     touchPrefsSetGpsFuzzM(uint16_t m);
+/** Answer a telemetry position REQUEST with the true fix instead of the advert
+ *  displacement. Off by default. The advert is a broadcast and stays displaced
+ *  either way; this only widens what a contact you already granted the location
+ *  permission to receives, in an encrypted reply they asked for. */
+bool     touchPrefsGetTelemLocExact();
+bool     touchPrefsSetTelemLocExact(bool on);
+bool    touchPrefsGetLoudAlerts();
+bool    touchPrefsSetLoudAlerts(bool on);
+bool    touchPrefsGetBootWifiTimeOpen();
+bool    touchPrefsSetBootWifiTimeOpen(bool on);
 bool    touchPrefsGetBootAdvert();
 bool    touchPrefsSetBootAdvert(bool on);
 
@@ -183,6 +270,10 @@ bool    touchPrefsSetCompactChat(bool on);
  * (the missed-messages class). Opt-in, default off = stock receive path. */
 bool    touchPrefsGetRxQueue();
 bool    touchPrefsSetRxQueue(bool on);
+uint32_t touchPrefsGetAppHide();       // v46: app-drawer hide bitmask (Store page toggles)
+bool     touchPrefsSetAppHide(uint32_t mask);
+bool    touchPrefsGetRetryEcho();      // v44/v45: auto-retry sends until echoed/ACKed (opt-in)
+bool    touchPrefsSetRetryEcho(bool on);
 uint32_t touchPrefsGetClockFloor();               // monotonic send-timestamp floor (#89)
 bool    touchPrefsSetClockFloor(uint32_t epoch);  // only ever grows; no-op below current
 
@@ -198,6 +289,13 @@ bool     touchPrefsSetLocalAdvMin(uint16_t mins);
  * instead of the stable channel (releases/TOUCH). Default off (stable). */
 bool    touchPrefsGetBetaUpdates();
 bool    touchPrefsSetBetaUpdates(bool on);
+
+// Beta test reports. The ping is the opt-in anonymous install count; the
+// reported-beta number is the build this device has already reported on.
+bool     touchPrefsGetReportPing();
+bool     touchPrefsSetReportPing(bool on);
+uint16_t touchPrefsGetReportedBeta();
+bool     touchPrefsSetReportedBeta(uint16_t n);
 
 /* Keyboard-nav tab hotkeys: the ASCII key that jumps to each main tab while
  * keyboard navigation is on. `tab` is the tab index 0..4 = chat / contacts / home
@@ -220,6 +318,22 @@ bool    touchPrefsSetNavDirKey(int idx, uint8_t ch);
  * (for users who prefer the launcher as their home). Toggled in the app drawer's cog. */
 bool    touchPrefsGetHomeIsDrawer();
 bool    touchPrefsSetHomeIsDrawer(bool on);
+
+/* M9 Home-key behavior: when true and the app drawer is configured as Home,
+ * pressing Home stays in or returns to the drawer instead of toggling Commander. */
+bool    touchPrefsGetHomeKeyKeepsDrawer();
+bool    touchPrefsSetHomeKeyKeepsDrawer(bool on);
+// External Bluetooth LE keyboard (v61): Bluetooth serves the phone app (false)
+// or the keyboard (true); the keyboard's layout; the paired keyboard, if any.
+bool    touchPrefsGetBleKbdMode();
+bool    touchPrefsSetBleKbdMode(bool keyboard);
+uint8_t touchPrefsGetBleKbdLayout();
+bool    touchPrefsSetBleKbdLayout(uint8_t layout);
+// v62: the HID usage of a key that acts as Back besides Esc (0 = none).
+uint8_t touchPrefsGetBleKbdBackKey();
+bool    touchPrefsSetBleKbdBackKey(uint8_t usage);
+bool    touchPrefsGetBleKbdPeer(uint8_t addr[6], uint8_t* addr_type, char* name, size_t name_cap);
+bool    touchPrefsSetBleKbdPeer(const uint8_t addr[6], uint8_t addr_type, const char* name);
 
 /** Hide the device/profile name in the status bar and move the clock to the
  *  left where the name used to be. Default false (name shown). */
@@ -356,7 +470,13 @@ int  touchPrefsCopyIgnored(uint8_t* out_buf);
  *  • touchPrefsCopyIgnoredNames: copy every stored name into `out_buf`
  *    (>= TOUCH_IGNORED_NAMES_MAX * TOUCH_IGNORED_NAME_LEN bytes); returns count. */
 constexpr int TOUCH_IGNORED_NAMES_MAX = 16;
-constexpr int TOUCH_IGNORED_NAME_LEN  = 28;   // fixed NUL-padded slot (>= MAX_SENDER_NAME+1)
+// Fixed NUL-padded slot, and it MUST stay >= UITask::MAX_SENDER_NAME + 1 — a slot narrower
+// than a sender stores a cut name that the full-width RX check can never match again, so
+// the block shows in the list and silently never fires. That invariant was prose only; it
+// is now a static_assert in UITask.cpp. Widened 28 -> 32 with MAX_SENDER_NAME 24 -> 31; the
+// slot width is baked into the stored blob (the entry count is its length / this), so the
+// key was renamed in the same change to migrate rather than mis-slot the old one.
+constexpr int TOUCH_IGNORED_NAME_LEN  = 32;
 bool touchPrefsIsNameIgnored(const char* name);
 bool touchPrefsSetNameIgnored(const char* name, bool ignored);
 int  touchPrefsCopyIgnoredNames(char* out_buf);
@@ -372,11 +492,31 @@ void    touchPrefsSetDiscoveredAutoEvict(bool on);
 uint8_t touchPrefsGetDiscoveredMaxHops();      // auto-delete discovered nodes heard via more hops than this (0 = off)
 void    touchPrefsSetDiscoveredMaxHops(uint8_t hops);
 bool    touchPrefsGetSoundMentions();          // default true
+// Spam filter: drop incoming messages whose body is one character (#spam). Default OFF.
+// Map: most contact dots drawn at once. 0 = no limit (default).
+uint16_t touchPrefsGetMapMarkerCap();
+void     touchPrefsSetMapMarkerCap(uint16_t n);
+bool    touchPrefsGetIgnoreTinyMsgs();
+void    touchPrefsSetIgnoreTinyMsgs(bool on);
 void    touchPrefsSetSoundMentions(bool on);
 bool    touchPrefsGetSoundDirect();            // direct/DM chime on/off, default true
 void    touchPrefsSetSoundDirect(bool on);
 uint8_t touchPrefsGetSoundVolume();            // 0..100, default 70
 void    touchPrefsSetSoundVolume(uint8_t vol);
+
+/** Do Not Disturb: silences the incoming-message chime during a daily time
+ *  window. Start/end are half-hour slots (0..47, slot = hour*2 + (min>=30)),
+ *  so the window can be set in 30-minute steps. The window may wrap past
+ *  midnight (start > end means "start..23:59 AND 00:00..end"); start == end
+ *  is a zero-length "never active" window. Only gates the sound chokepoint in
+ *  newMsgImpl() — chat bubbles/badges/unread counts are unaffected, and
+ *  Settings-page sound previews still play while DND is on. */
+bool    touchPrefsGetDndEnabled();             // default false
+void    touchPrefsSetDndEnabled(bool on);
+uint8_t touchPrefsGetDndStartSlot();           // 0..47, default 44 (22:00)
+void    touchPrefsSetDndStartSlot(uint8_t slot);
+uint8_t touchPrefsGetDndEndSlot();             // 0..47, default 12 (06:00)
+void    touchPrefsSetDndEndSlot(uint8_t slot);
 
 /** Per-event notification sound FILE (empty = built-in chime). Slot:
  *  0 = message, 1 = direct/DM, 2 = @-mention. Stored as a path pref like the
@@ -400,8 +540,12 @@ bool    touchPrefsGetScrollReverse();          // invert trackball/scrollball di
 void    touchPrefsSetScrollReverse(bool on);
 bool    touchPrefsGetEdgeScroll();             // push cursor past edge to scroll content (default false)
 void    touchPrefsSetEdgeScroll(bool on);
-bool    touchPrefsGetLockOnScreenOff();        // idle screen-off auto-locks; only a deliberate hold wakes (default false)
+bool    touchPrefsGetLockOnScreenOff();        // idle screen-off auto-locks (default false; forced on for Pro/Max e-paper)
 void    touchPrefsSetLockOnScreenOff(bool on);
+bool    touchPrefsGetGlanceWhenLocked();       // "at a glance" also fires while manually/idle locked, not just unlocked+dimmed (default false)
+void    touchPrefsSetGlanceWhenLocked(bool on);
+bool    touchPrefsGetGlanceEnabled();          // master "at a glance" feature toggle (default true)
+void    touchPrefsSetGlanceEnabled(bool on);
 
 /** Per-channel mute, keyed by channel name. Bit 0 = mute messages, bit 1 =
  *  mute @-mentions. Suppresses the notification SOUND for that channel (the
@@ -435,7 +579,7 @@ bool touchPrefsSetTileServer(const char* url);
  *  mesh NodePrefs (default_scope_key, derived via MyMesh::setDefaultFloodScope);
  *  this just remembers the human-readable "#region" the user typed so the radio
  *  settings field can show it back. Empty = unscoped. */
-constexpr int TOUCH_REGION_SCOPE_MAXLEN = 40;
+constexpr int TOUCH_REGION_SCOPE_MAXLEN = 31;  // '#' + 29-byte public name + NUL
 int  touchPrefsGetRegionScope(char* out, int out_cap);
 bool touchPrefsSetRegionScope(const char* name);
 
@@ -532,6 +676,9 @@ bool     touchPrefsSetGpsBaud(uint32_t baud);
 bool     touchPrefsGetSigProbeEnabled();
 bool     touchPrefsSetSigProbeEnabled(bool on);
 uint16_t touchPrefsGetSigPollMins();
+
+/* NB: there is deliberately no touchPrefsGet/SetP4Antenna(). The T-Display P4 antenna choice is
+ * session-only so that every boot comes up on the on-board antenna — see the note in the .cpp. */
 bool     touchPrefsSetSigPollMins(uint16_t mins);
 
 #endif

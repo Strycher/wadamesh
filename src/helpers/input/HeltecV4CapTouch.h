@@ -14,6 +14,11 @@ int heltecV4CapTouchCheck();
 bool heltecV4CapTouchPopTap(uint16_t* x, uint16_t* y);
 /** True while finger is down; returns latest mapped display coordinates. */
 bool heltecV4CapTouchGetLive(uint16_t* x, uint16_t* y);
+#if defined(HAS_TDECK_PRO)
+/** Physical hold duration from the Pro touch driver, or 0 unless the latest
+ * hardware sample still reports a finger. */
+uint32_t heltecV4CapTouchHeldMs();
+#endif
 /**
  * Pop pending swipe gesture in display coordinates.
  * x_dir: -1 left, +1 right, 0 none
@@ -57,6 +62,7 @@ bool heltecV4CapTouchIsSwiping();
  * the display rotation changes (boot + on a rotation toggle). Default 0.
  */
 void heltecV4CapTouchSetRotation(uint8_t lvgl_rot);
+void heltecV4CapTouchSetSlowPoll(bool slow);   // screen-off poll throttle (R8 shared-bus)
 
 /**
  * Set the HARDWARE-rotation touch-point transform. When the panel is rotated

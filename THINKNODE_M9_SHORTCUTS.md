@@ -1,0 +1,162 @@
+# ThinkNode M9: Keyboard & D-pad Guide
+
+The Elecrow ThinkNode M9 has **no touchscreen** — every screen, every setting,
+and every chat is driven by the d-pad, the dedicated function keys, and the
+QWERTY keyboard. If you're coming from the T-Deck or Heltec V4 (touch-first),
+this page is the five-minute tour that makes the board feel native.
+
+## The inputs
+
+- **D-pad** — four arrows around a centre button (**OK**). Arrows move the
+  on-screen focus highlight; OK activates whatever is focused. **Holding OK**
+  is the board's long-press: it fires the held item's long-press action (a
+  chat message's context menu, the SD row's hold-to-format) and unlocks the
+  lock screen.
+- **Function row** — dedicated keys for Chats, Home, Mentions, Advert, Map,
+  Back, Mic and Ctrl (see the table below).
+- **QWERTY keyboard** — the keyboard controller resolves Shift/symbol layers
+  itself, so keys always deliver their final character. It latches one key at
+  a time, which is why there are no chords on this board — long-press carries
+  the second layer instead. Start typing in a chat and the composer focuses
+  itself; any key wakes the screen from idle.
+
+## The one rule: Back closes what you see, then goes back
+
+**Back** always closes the *top* layer, one per press: map pan mode → an open
+dropdown → the power menu → the Control Center → a full-screen app → a dialog
+→ any popup → an open chat. Nothing ever closes invisibly beneath something
+else.
+
+Once there is nothing left covering the screen, **Back returns you to the
+previous screen** — the tab you came from, however you got there: a function
+key, an app-drawer tile, "Show on map", a contact's Send-msg button. Keep
+pressing and you keep walking back through where you have been. When the trail
+runs out Back lands on Home, and on Home with nothing open it does nothing,
+because that is the root.
+
+**HOME** is the shortcut past all of that: it goes straight to the root and
+clears the trail, so Back from there won't jump you back out again.
+When **App drawer as home** is enabled, the drawer cog's **Lock home to drawer**
+option makes HOME stay in or return to the drawer, and makes Back stop there as
+the root after closing anything above it. The **Cmdr** tile still opens the
+Commander screen when you need it.
+
+The only exception is deliberate: progress overlays (SD format, bulk delete)
+block all keys until the operation finishes — Back will not navigate out from
+under a running operation.
+
+## Function keys
+
+| Key | Press | Hold |
+|---|---|---|
+| **MSG** | Jump to the Chats tab; inside a conversation, return to the chat list (closes an open app first) | — |
+| **HOME** | Peel one layer off an open app; on the Home tab, toggle the app drawer; otherwise jump Home (and clear the Back trail) | — |
+| **@ (Mentions)** | Open the Mentions screen | — |
+| **ADV** | Open the Send Advert page | **Toggle GPS on/off** |
+| **MAP** | Jump to the Map tab — press again *on* the map to toggle pan mode | — |
+| **BACK** | Close the top layer (see above) | — |
+| **CTRL** | Open the Control Center (quick toggles, incl. the keyboard light: off / on / auto) | — |
+| **MIC** | Nothing yet — deliberately reserved | — |
+| **OK / Enter** | Activate the focused item; send a message; run a terminal command; newline in the editor | **Long-press the focused item / unlock the lock screen** |
+
+The **MSG**, **HOME**, **@**, **ADV**, **MAP**, and **CTRL** shortcuts remain
+active while typing or using a picker. Back, the d-pad, and OK remain contextual
+so they can leave edit mode, move the caret or selection, and activate controls.
+
+## Map pan mode
+
+On the Map tab, press **MAP** again: the arrows now pan the map instead of
+moving focus. **MAP** or **BACK** exits. Pan mode switches itself off whenever
+you leave the map or anything opens over it, so a stale pan can never eat a
+key press later. Auto-follow pauses while you pan and resumes when you exit.
+Entering the map fresh always starts in normal navigation.
+
+## Files and offline maps
+
+From the Home tab, press **HOME** to open the app drawer. **Files** browses and
+organizes the M9's SD card. **Transfer** starts an authenticated browser session
+for uploads and downloads over the same Wi-Fi network.
+
+To install an offline map, open Transfer, visit the displayed URL, enter the
+six-digit code, choose **Offline OSM map (/tiles)**, and select an unpacked
+folder containing `z/x/y.png` tiles. After it completes, open Map options,
+select OSM, and enable **Tiles from SD card**. See the
+[offline map tile guide](README.md#offline-map-tiles) for the QGIS export steps
+and map-provider policy requirements.
+
+## Typing & editing
+
+Inside a text field the left/right arrows move the caret — and when the caret
+is already at the edge of the text, the same press steps focus *out* of the
+field, so you're never stuck. Enter sends (toggleable under Settings), Back
+leaves the field. In the Terminal, Enter runs the command; in the text editor
+it inserts a newline.
+
+While a chat message is focused and newer messages are below it, a down arrow
+appears at the right edge. Press **Right** to select it, then **OK** to jump to
+the newest message.
+
+Channels, direct messages, and room conversations place **#** and emoji to the
+right of the message input. Press Right to move from the input to **#**, and
+Right again to move to emoji. Press **OK** on either button to open its picker.
+
+In the symbol grid, use all four arrows to move the highlight and **OK** to
+insert the selected character.
+
+The Create/Join channel forms use the same **#** action beside every text
+field. Right moves from the field to **#**; Left returns to editing the field.
+Password fields use the same control, including Wi-Fi, MQTT, and repeater login.
+After inserting a symbol, focus returns to the originating text field.
+
+## Lock screen
+
+**Hold OK** to unlock — the keyboard's hardware long-press stands in for the
+hold-to-unlock other boards do by touch. With "Flash on new message" enabled,
+an incoming message wakes (or lock-reveals) the screen and pulses the keyboard
+backlight.
+
+## Inside apps
+
+Store apps (Snake and friends) get the d-pad natively: arrows steer, OK taps
+the centre — start, steer, and tap-to-retry all work. Display-only apps
+(Airtime, RF Monitor) keep normal navigation: arrows move between the app's
+own buttons or scroll the feed. **Back and Home always escape an app** — no
+app can trap the keys, even while the screen is locked.
+
+## Recent improvements (beta_66 branch)
+
+If you last used the M9 on an earlier beta, the notable navigation changes:
+
+- **Back now actually goes back** — once everything covering the screen was
+  closed, Back had nothing left to do and the press simply died on any bare
+  tab. It now walks back through the screens you visited, then Home. Jumps that
+  used to strand you ("Show on map" from Discover or Contacts, a route replay
+  from a chat, the Home unread line, the ✉ badge, app-drawer tiles) all return
+  properly. **Back also works in the first-boot wizard** now, stepping back
+  through its screens like the on-screen Back button.
+- **Back restored and made consistent** — it had regressed to doing nothing
+  outside text fields, and could close hidden popups beneath the Control
+  Center. Both fixed; the close-what-you-see rule above now holds everywhere.
+- **The map opens faster the first time** — the cold open was doing a
+  whole-card zoom scan whose result was thrown away, and (with no GPS fix) was
+  repeating that scan on *every* open. The "Loading map…" hint now appears
+  immediately instead of after the scan, so the board no longer looks frozen on
+  the previous screen while the first tiles decode.
+- **The d-pad no longer goes dead for a second** when a message arrives, and
+  the Spectrum page no longer steers an invisible cursor around the app drawer
+  underneath it.
+- **Apps can't strand you** — opening Advert/Mentions over a running app used
+  to orphan it with no key path back; app permission dialogs are now
+  answerable with the d-pad.
+- **Map pan cleans up after itself** (see above — it used to leak across tab
+  jumps).
+- **Keyboard light "On" applies at boot**, not after the first dim cycle.
+- **Terminal chat shows incoming replies**, not just your own sent lines.
+- **GPS works from a cold boot** — the toggle (and ADV-hold) no longer depends
+  on a boot-time detection race.
+- **Spectrum analyzer** sweeps roughly twice as fast, survives read glitches
+  without flattening the trace, and waits for an in-flight transmission
+  instead of cutting it off when opened mid-send.
+
+The engineering record behind these lives in
+[`variants/thinknode_m9/M9_PORT.md`](variants/thinknode_m9/M9_PORT.md).

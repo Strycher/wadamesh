@@ -4,11 +4,27 @@
 #include <WiFi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include "WebFileTransferConfig.h"
+
+#if defined(HAS_TDISPLAY_P4)
+  // Same type rebind as TCPCompanionServer.h (every TU must see one consistent class layout).
+  // NB: begin() is never called on the P4 — ESP-AT has a single listening port, so a first-byte
+  // router in MultiTransportCompanionInterface accepts everything on the companion port and
+  // hands HTTP/WS connections here via adoptClient() (_port stays 0; pause/resumeListen no-op).
+  #include <C6WifiShim.h>
+  #include <C6Socket.h>
+  #define WiFiClient C6Client
+  #define WiFiServer C6Server
+#endif
 
 class WebMirror;   // web-UI mirror bridge (WebMirror.h); included in the .cpp
 
 #ifndef WS_COMPANION_MAX_CLIENTS
-#define WS_COMPANION_MAX_CLIENTS  2
+  #if WADA_WEB_FILE_TRANSFER
+    #define WS_COMPANION_MAX_CLIENTS  3
+  #else
+    #define WS_COMPANION_MAX_CLIENTS  2
+  #endif
 #endif
 
 #ifndef WS_HANDSHAKE_MAX_LEN
@@ -43,7 +59,18 @@ struct WSClientState {
 
   bool is_mirror;      // this client is a web-UI mirror (GET /mirror), not a companion peer
   bool is_term;        // this client is a web mesh terminal (GET /term)
+  bool is_files;       // authenticated browser file transfer (GET /files)
   bool meta_sent;      // mirror: the one-time screen-size meta frame has been sent
+  uint8_t lock_sent;   // mirror: lock state last sent to this browser (0xFF = not yet)
+#if WADA_WEB_FILE_TRANSFER
+  bool files_authed;
+  bool files_close_after_tx;
+  bool files_request_pending;
+  uint32_t files_frame_started_ms;
+  uint8_t files_auth_failures;
+  uint8_t* files_rx_buf;
+  uint16_t files_rx_len;
+#endif
 
   // Mirror TX buffer: one WS frame (header + payload) queued for this client, drained
   // NON-BLOCKING across loop iterations. The loop never spins on a socket write and a
@@ -68,6 +95,10 @@ public:
   size_t pollRecvFrame(uint8_t dest[], int* client_index_out);
   /** Accept new clients and prune disconnects; call from main loop for timely handshakes. */
   void tickHandshake();
+  /** Slot-insert an already-accepted connection (evicts the oldest handshaking client if
+   *  full). Lets an external router (T-Display P4: one shared AT listener) hand us
+   *  HTTP/WS clients that were accepted on the companion port. */
+  void adoptClient(WiFiClient& incoming);
 
   size_t writeToClient(int client_index, const uint8_t src[], size_t len);
   size_t writeToAllClients(const uint8_t src[], size_t len);
@@ -102,6 +133,11 @@ private:
   void drainClientTx(int idx);        // push a mirror client's pending tx_buf bytes, non-blocking
   void serviceTerminalClients(WebMirror& m);   // web mesh terminal: reply text out + command text in
   void drainTermInput(int idx, WebMirror& m);  // parse a term client's WS frames -> m.pushTermCmd
+#if WADA_WEB_FILE_TRANSFER
+  void serviceFileClients();
+  void drainFileInput(int idx);
+  bool sendFileReply(int idx, const char* text);
+#endif
 
   // The _clients array is now touched by TWO cores: the main loop (accept/handshake +
   // companion RX/TX, core 1) and the dedicated mirror stream task (serviceMirror, core 0).

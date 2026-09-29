@@ -27,6 +27,10 @@ struct ContactInfo;
 /** Maps bottom tabs (Home, Chats, Contacts, Set — no separate Net tab). */
 enum class TouchUiScreen : uint8_t { Home = 0, ChatInbox = 1, Contacts = 2, Settings = 3 };
 
+void sdMountDiagBegin();
+void sdMountDiagAttempt(uint32_t hz, bool begin_ok, bool card_ready);
+void sdMountDiagSetMounted(bool mounted, uint32_t hz);
+
 class UITask : public AbstractUITask {
 public:
   static const int MAX_UI_MESSAGES = 500;
@@ -36,7 +40,11 @@ public:
   static const int MAX_UI_MESSAGES_SD = 5000;
   static const int MAX_UI_THREADS = 48;
   static const int MAX_THREAD_NAME = 32;
-  static const int MAX_SENDER_NAME = 24;
+  // Full MeshCore name width: ContactInfo::name / ChannelDetails::name / NodePrefs::
+  // node_name are all char[32], so 31 chars + NUL is exactly lossless. Was 24, which
+  // silently dropped every longer name. The PERSISTED width is frozen separately
+  // (k_ui_disk_sender_len in UITask.cpp) — raising this does not move any on-disk field.
+  static const int MAX_SENDER_NAME = 31;
   static const int MAX_MSG_TEXT = 160;   // full LoRa text length (was 96 -> cut long msgs ~3 lines)
   static const int MAX_UI_PATH = 32;  // inbound-route bytes/message for the Info popup (covers deep + multi-byte-hash routes)
 
@@ -56,10 +64,39 @@ public:
     MSG_META_HAS_RX    = (1u << 0),  // snr_q4/rssi/path_len populated
     MSG_META_IS_FLOOD  = (1u << 1),  // packet was flooded (path_len = hop count); else 0xFF / direct
     MSG_META_HAS_SCOPE = (1u << 2),  // in_scope holds a valid transport scope (transport_codes[0])
+    // The scope code is an HMAC of THIS packet's payload under the sender's
+    // region key, so it differs for every message and cannot be read as a region
+    // id (#259). The only thing a receiver can say about it is whether it
+    // verifies against a key we hold — which we check at RX, while the packet is
+    // still around, and record here.
+    MSG_META_SCOPE_HOME = (1u << 3),  // in_scope verified against OUR region key
+    // Bits 4-7: which REGISTERED region in_scope verified against (#271), as a
+    // RegionRegistry slot, where 0 = none/unknown, 15 = several regions matched
+    // and 1..14 name one. Packed into the spare top nibble on purpose: meta_flags is
+    // already persisted at a fixed offset, so this costs no record growth and no
+    // history version bump, and messages written before a region was registered
+    // read back 0, which is exactly the honest "unknown" state. A slot is stable
+    // for the life of the history and is never a list index, so deleting or
+    // reordering regions cannot relabel old messages.
+    MSG_META_SCOPE_SLOT_SHIFT = 4,
+    MSG_META_SCOPE_SLOT_MASK  = 0xF0,
   };
+  static uint8_t metaScopeSlot(uint8_t meta_flags) {
+    return (uint8_t)((meta_flags & MSG_META_SCOPE_SLOT_MASK) >> MSG_META_SCOPE_SLOT_SHIFT);
+  }
+  static uint8_t metaWithScopeSlot(uint8_t meta_flags, uint8_t slot) {
+    return (uint8_t)((meta_flags & ~MSG_META_SCOPE_SLOT_MASK)
+                     | ((slot & 0x0F) << MSG_META_SCOPE_SLOT_SHIFT));
+  }
 
   struct UIMessage {
     uint32_t ts;
+    // Monotonic per-record sequence number, assigned at append and persisted by
+    // the segmented store (its record-to-segment mapping keys on seq ranges).
+    // NEVER reset mid-session; the boot loader seeds the generator from
+    // max(loaded seq)+1. Distinct from _msgcount, which the companion protocol
+    // may overwrite (msgRead) and therefore cannot be a unique key.
+    uint32_t seq;
     bool channel;
     bool outgoing;
     uint32_t ack_hash;       // expected-ack for outgoing DMs (0 if none / channel / incoming)
@@ -132,15 +169,39 @@ private:
   char _alert[80];
   unsigned long _alert_expiry;
   int _msgcount;
+  /** Next UIMessage::seq to hand out. Seeded by the loader (max loaded seq + 1),
+   *  strictly monotonic for the session. See UIMessage::seq. */
+  uint32_t _ui_seq_next = 1;
   int _ui_msg_count;
   int _ui_msg_head;
   /** Runtime ring capacity: MAX_UI_MESSAGES_SD when history lives on an SD card,
    *  else MAX_UI_MESSAGES. Fixed for the whole boot (chosen before the PSRAM
    *  alloc in begin()); the loader linearizes files written under another cap. */
   int _ui_msg_cap = MAX_UI_MESSAGES;
+  /** "Does this thread have any stored message?", answered in O(1).
+   *
+   *  threadHasMessageHistory() used to answer it by walking the message ring looking for a
+   *  match, and the inbox/unread paths call it once PER THREAD. A thread that HAS recent
+   *  messages exits that scan early; a thread with none scans every record in the ring doing
+   *  a strncmp each — and "no history" is exactly what those callers are testing for. With a
+   *  busy public channel filling the ring (a field report: 3800 messages) each inbox refresh
+   *  became tens of thousands of string compares, which is the reported "interface slows down
+   *  drastically", and why it was still felt at only ~300 messages.
+   *
+   *  Appends set the owning thread's flag directly, so the common path never scans. Anything
+   *  that REMOVES messages (ring eviction, delete, clear, a fresh load) can only invalidate
+   *  the flags, so it just marks them dirty and the next reader rebuilds all threads in ONE
+   *  ring pass instead of one pass per thread. */
+  mutable uint16_t _thread_msgs[MAX_UI_THREADS] = { 0 };
+  mutable bool     _thread_hist_dirty = true;
+  void rebuildThreadHistoryFlags() const;
+  /** Drop this thread's oldest stored messages until it is back within the per-chat cap
+   *  (touchPrefsGetHistPerChat; 0 = uncapped). Called after an append. */
+  void enforceHistoryCap(int thread_idx);
   unsigned long _next_thread_seed;
   UIMessage* _ui_msgs   = nullptr;   // ring of recent messages — PSRAM-allocated in begin()
   UIThread*  _ui_threads = nullptr;  // thread table — PSRAM-allocated in begin()
+  void allocMessageStore();          // ring + thread table; also used by console mode
   unsigned long ui_started_at, next_batt_chck;
   int next_backlight_btn_check = 0;
 #ifdef PIN_STATUS_LED
@@ -167,7 +228,7 @@ private:
   bool _composer_mode;
   int _composer_char_idx;
   int _composer_action_idx;
-  char _compose_buf[128];
+  char _compose_buf[MAX_MSG_TEXT + 1];   // full LoRa text length; was 128 -> silently chopped sends at 127 bytes (GH #119)
   unsigned long _next_mesh_thread_refresh;
   TouchUiScreen _touch_screen;
   bool _active_dm_contact_set;
@@ -234,6 +295,8 @@ private:
   bool loadThreadsFromStorage();
   bool loadMsgsFromStorage();
   bool loadLegacyHistoryFromStorage();
+  bool loadMsgsFromSegments();     // segmented store (generation 3) loader
+  bool migrateRingToSegments();    // one-time old-format -> segments migration (verify-then-delete)
   bool saveThreadsToStorage();
   bool saveMsgsToStorage();
 
@@ -276,6 +339,12 @@ public:
   int  getUnreadTotal() const;
   int  getUnreadMentionCount() const;   // # of threads with an unread @mention of me
   void markThreadRead(int idx);   // clear one thread's unread count (persisted)
+  // Console mode: list threads with their unread counts (read-only), and clear
+  // one deliberately. Kept separate so the monitor cannot mark anything read.
+  int  consoleThreadAt(int idx, char* name, size_t cap, int* unread, bool* is_channel);
+  bool consoleMarkThreadRead(const char* name);
+  int  consoleHistoryAt(const char* thread, int back, char* sender, size_t sc,
+                        char* text, size_t tc, uint32_t* ts, bool* outgoing);
   void markActiveThreadRead();    // clear the currently-open thread's unread (viewing == read)
   void markAllThreadsRead();      // clear every thread's unread count
   bool threadHasMention(int idx) const;   // unread @mention of me in this thread
@@ -321,6 +390,8 @@ public:
   // Active channel's mesh slot (-1 when the open thread isn't a channel). For the
   // status-bar channel-settings gear (per-channel region scope).
   int16_t activeChannelSlot() const {
+    // _ui_threads is null in console mode (allocated later in begin()).
+    if (!_ui_threads) return -1;
     if (!_active_thread_is_channel || _active_thread_idx < 0 || _active_thread_idx >= MAX_UI_THREADS) return -1;
     return _ui_threads[_active_thread_idx].mesh_channel_slot;
   }
@@ -330,6 +401,7 @@ public:
    *  deleting a channel actually drops its mesh-table entry — otherwise
    *  refreshThreadsFromMesh() recreates the thread from the surviving channel. */
   int16_t threadMeshChannelSlot(int idx) const {
+    if (!_ui_threads) return -1;                       // console mode: no table
     if (idx < 0 || idx >= MAX_UI_THREADS || !_ui_threads[idx].used || !_ui_threads[idx].channel) return -1;
     return _ui_threads[idx].mesh_channel_slot;
   }
@@ -353,18 +425,26 @@ public:
     if (idx < 0 || idx >= MAX_UI_THREADS || !_ui_threads[idx].used || !_ui_msgs) return false;
     const bool ch  = _ui_threads[idx].channel;
     const char* nm = _ui_threads[idx].name;
-    int best = -1; uint32_t best_ts = 0;
-    for (int i = 0; i < _ui_msg_cap; ++i) {
-      const UIMessage& m = _ui_msgs[i];
+    // Newest by RING ORDER, not by timestamp. m.ts is taken from the ESP32 system clock,
+    // which is not monotonic across reboots: it restarts from ESP32RTCClock::begin()'s
+    // power-on seed every boot and only climbs with uptime until a real time source lands.
+    // Picking max(ts) therefore let a message received hours into an EARLIER boot outrank
+    // every message from this one, so the chat-list preview stuck on an old message and
+    // never updated (reported on the T-Display P4, whose system clock stayed on that seed
+    // because it has an RTC chip — see the mirror in ClockFloorRTC). Ring order is the
+    // actual arrival order and cannot be wrong, so walk back from the head and take the
+    // first match; that also exits immediately instead of scanning the whole ring.
+    for (int i = 0; i < _ui_msg_count; ++i) {
+      const int slot = (_ui_msg_head - 1 - i + _ui_msg_cap) % _ui_msg_cap;
+      const UIMessage& m = _ui_msgs[slot];
       if (!m.text[0] || m.channel != ch) continue;
       if (strncmp(m.thread, nm, MAX_THREAD_NAME) != 0) continue;
-      if (best < 0 || m.ts >= best_ts) { best = i; best_ts = m.ts; }   // >= : a later slot wins ts ties (newer in the ring)
+      if (sender && sender_cap) { strncpy(sender, m.sender, sender_cap - 1); sender[sender_cap - 1] = '\0'; }
+      if (text && text_cap)     { strncpy(text,   m.text,   text_cap - 1);   text[text_cap - 1] = '\0'; }
+      if (outgoing) *outgoing = m.outgoing;
+      return true;
     }
-    if (best < 0) return false;
-    if (sender && sender_cap) { strncpy(sender, _ui_msgs[best].sender, sender_cap - 1); sender[sender_cap - 1] = '\0'; }
-    if (text && text_cap)     { strncpy(text,   _ui_msgs[best].text,   text_cap - 1);   text[text_cap - 1] = '\0'; }
-    if (outgoing) *outgoing = _ui_msgs[best].outgoing;
-    return true;
+    return false;
   }
   int  threadScroll() const { return _thread_scroll; }
   void setThreadScroll(int v) { _thread_scroll = v; }
@@ -420,6 +500,13 @@ public:
   bool getGpsFix();
   /** Satellites currently in view, or -1 if unknown / no GPS hardware. */
   int  getGpsSats();
+  /** UTC epoch the GPS itself has decoded, or 0 if it has none yet. A receiver decodes TIME from
+   *  the satellite stream well before it can solve a POSITION, so a valid time with no fix is
+   *  positive proof the module is alive and tracking, not dead. That is the distinction the GPS
+   *  page could not previously show, and it is what "acquiring..." was hiding. */
+  uint32_t getGpsTime();
+  /** Altitude in metres from the last fix (0 when there is no fix). */
+  int  getGpsAltitude();
   /** True once a valid fix has been seen this session. */
   bool getGpsHadFix() const { return _gps_had_fix; }
   double getNodeLat() const { return _sensors ? _sensors->node_lat : 0.0; }
@@ -438,6 +525,7 @@ public:
   void setPathHashMode(uint8_t mode);
   void setExperimentalFlags(uint8_t multi_acks, uint8_t client_repeat, uint8_t rx_boosted);
   void setTelemetryAllow(bool on);   // answer mesh telemetry requests (battery+env; location stays separate)
+  void setLocationTelemetryMode(uint8_t mode);   // TELEM_MODE_* — position on request (#266)
   /** Meshcomod CLI on device: `wifi on` / `wifi off`. */
   bool setWifiRadio(bool on);
   bool isTcpEnabled() const { return _serial && _serial->isTcpEnabled(); }
@@ -445,15 +533,16 @@ public:
   void disableTcp() { if (_serial) _serial->disableTcp(); }
   bool hasBleCapability() const { return _serial && _serial->hasBleCapability(); }
   bool isBleEnabled() const { return _serial && _serial->isBleEnabled(); }
-  // Live BLE enable, guarded like the boot co-init in main.cpp: NimBLE needs
-  // ~50 KB free internal heap + a 20 KB contiguous block, and starting it below
-  // that does not fail cleanly — it panics mid-init (the "reboots when I turn
-  // BLE on with Wi-Fi running" report). Returns false when refused; the caller
-  // shows the reason and reverts its switch. Defined in UITask.cpp.
+  // Live BLE enable. The concrete transport applies its heap guard only for a
+  // cold NimBLE allocation; re-enabling a pre-created stack is allocation-free.
+  // Returns false when a required cold start cannot be made safely.
   bool enableBle();
   void disableBle() { if (_serial) _serial->disableBle(); }
+  // The companion transport, for board code that knows its concrete type.
+  BaseSerialInterface* serialInterface() const { return _serial; }
   int getWsConnectedCount() const { return _serial ? _serial->getWsConnectedCount() : 0; }
-  void setDeviceTimeFromSystemClock();
+  /** Push the ESP32 system clock into the mesh RTC. false = never synced, mesh clock untouched. */
+  bool setDeviceTimeFromSystemClock();
   /** Mark recent user input — call when touch / hw button is detected. */
   void noteUserInput();
   /** Get / set the screen-off-after-idle timeout (0 = never). Persists in NVS. */
@@ -486,6 +575,7 @@ public:
   // lost — the periodic flush is off-thread and rate-capped. Overrides the
   // AbstractUITask hook so the companion CMD_REBOOT path flushes too.
   void persistHistoryNow() override;
+  void flushHistorySoon();   // arm an immediate OFF-THREAD flush (worker) — no min-delay clamp, no UI stall
 
   // from AbstractUITask
   void msgRead(int msgcount) override;
@@ -512,6 +602,7 @@ public:
   void discoveredContact(const ContactInfo& contact, bool is_new, uint8_t path_len) override;
   void onPingReply(const ContactInfo& contact, const uint8_t* data, size_t len) override;
   void onTelemetryReply(const ContactInfo& contact, const uint8_t* data, size_t len) override;
+  void onRegionListReply(const ContactInfo& contact, const uint8_t* data, size_t len) override;
   void onAdminLoginResult(const ContactInfo& contact, bool success, uint8_t perms) override;
   void onServerClock(const ContactInfo& contact, uint32_t server_epoch) override;
   void onAdminCommandReply(const ContactInfo& contact, const char* text) override;

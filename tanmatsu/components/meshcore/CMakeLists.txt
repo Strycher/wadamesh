@@ -9,9 +9,24 @@
 #   - helpers/sensors/*   -> telemetry; deferred (re-add with the sensor libs later)
 #   - the MC_VENDORED_TOUCH_APP files -> our own src/ ships them (avoid duplicate symbols)
 set(CORE "core/src")
+set(TXT_TIMESTAMP_SOURCE "${CMAKE_CURRENT_LIST_DIR}/${CORE}/helpers/BaseChatMesh.cpp")
+if(NOT EXISTS "${TXT_TIMESTAMP_SOURCE}")
+  message(FATAL_ERROR "MeshCore sources are missing; run tanmatsu/fetch-deps.sh")
+endif()
+execute_process(
+  COMMAND python3 "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/build/patch_meshcore_txt_timestamp.py"
+          --verify-file "${TXT_TIMESTAMP_SOURCE}"
+  RESULT_VARIABLE TXT_TIMESTAMP_VERIFY_RESULT
+  OUTPUT_VARIABLE TXT_TIMESTAMP_VERIFY_OUT
+  ERROR_VARIABLE TXT_TIMESTAMP_VERIFY_ERR
+)
+if(NOT TXT_TIMESTAMP_VERIFY_RESULT EQUAL 0)
+  message(FATAL_ERROR "Vendored MeshCore failed issue #374 verification; run tanmatsu/fetch-deps.sh\n${TXT_TIMESTAMP_VERIFY_OUT}${TXT_TIMESTAMP_VERIFY_ERR}")
+endif()
 file(GLOB_RECURSE CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/${CORE}/*.cpp")
 list(FILTER CORE_SRCS EXCLUDE REGEX "/helpers/radiolib/")
 list(FILTER CORE_SRCS EXCLUDE REGEX "/helpers/sensors/")
+list(FILTER CORE_SRCS EXCLUDE REGEX "/helpers/ethernet/")   # 1.17: RAK13800/CH390 ethernet ifaces need libs we don't vendor
 list(FILTER CORE_SRCS EXCLUDE REGEX "(NRF52Board|TBeamBoard)\\.cpp$")   # keep ESP32Board (base TanmatsuBoard extends); drop nRF52 + the RadioLib S3 board
 list(FILTER CORE_SRCS EXCLUDE REGEX "/helpers/ui/.*(Display|OLED|TFT|Epaper|EInk|GxEPD|U8g2|SH1106|SSD1306|ST77|ILI9|Adafruit).*\\.cpp$")
 list(FILTER CORE_SRCS EXCLUDE REGEX "(LvglPsramAlloc|TouchDiagTrace)\\.cpp$")
