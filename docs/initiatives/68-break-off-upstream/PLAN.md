@@ -54,7 +54,9 @@ Tasks are 3–4 points. Each Epic ends with a verification task and gets one PR.
 | **A3 · Branch protection on `main`:** require a PR. Checked by `gh api repos/Strycher/wadamesh/branches/main/protection` returning `required_pull_request_reviews`. | 3 |
 | **A4 · Epic verification:** `gh pr create` from a scratch branch targets Strycher not ALLFATHER-BV; a direct push to `main` is refused; `main` contains `beta_85`; and the named command below is green on the new `main`. | 1 |
 
-### Epic B: land the R8 / V4 work
+**Epic A is DONE** (2026-09-30). `main` is at `7964140`; `beta_85` is an ancestor; protection binds everyone with five required checks. One scar worth keeping: A2 was landed as a **squash**, which discarded the ancestry, and had to be repaired with a tree-preserving `merge -s ours`. Cause: the upstream merge was carried on a PR branch. **A vendor tag is merged on `main` directly, never through a PR** — recorded in `CLAUDE.md`.
+
+### Epic B: land the R8 / V4 work — [#77](https://github.com/Strycher/wadamesh/issues/77) · `wadamesh-6vu`
 
 | Task | Pts |
 |---|---|
@@ -62,21 +64,21 @@ Tasks are 3–4 points. Each Epic ends with a verification task and gets one PR.
 | **B2 · Confirm the R8 env exists and builds** (`heltec_v4_r8_tft_companion_radio_usb_tcp_touch`), and correct its stale "UNTESTED" comment. | 3 |
 | **B3 · Epic verification:** both envs build; no device flash. | 1 |
 
-### Epic C: land coex + Windows build tooling
+### Epic C: land coex + Windows build tooling — [#78](https://github.com/Strycher/wadamesh/issues/78) · `wadamesh-0q2`
 
 | Task | Pts |
 |---|---|
 | **C1 · Re-apply the two `test-beta36` commits** — Windows build tooling (`force_tempfile`, `inject_version`) and the WiFi-first BLE ordering with heap-guarded `WiFi.begin`. Decide per-hunk whether upstream has since superseded the coex work. | 4 |
 | **C2 · Epic verification.** | 1 |
 
-### Epic D: land CrowPanel7
+### Epic D: land CrowPanel7 — [#79](https://github.com/Strycher/wadamesh/issues/79) · `wadamesh-qlj`
 
 | Task | Pts |
 |---|---|
 | **D1 · Replay `epic/2-crowpanel7-port` (32 commits) onto the new `main`.** Highest conflict surface — `UITask.cpp`, `MyMesh.*`, `main.cpp` SD/LDO4 ordering, `DataStore.cpp`. Resolution needs CrowPanel7 intent; see the hand-off notes on #2. | 4 |
 | **D2 · Epic verification:** `crowpanel7_companion_radio_touch` builds green. | 1 |
 
-### Epic E: Feature Integration Testing
+### Epic E: Feature Integration Testing — [#80](https://github.com/Strycher/wadamesh/issues/80) · `wadamesh-jul`
 
 | Task | Pts |
 |---|---|
@@ -95,8 +97,8 @@ What merging this plan authorizes, in words:
 
 | Term | Proposed | Why |
 |---|---|---|
-| **What merging this plan authorizes** | Epic A only, for now | Only Epic A has an issue. B–E get issues when this plan merges, per canon; the grant is then re-minted to extend the chain. A re-mint keeps the uses already counted. |
-| **Merges** | 1 | Basis: Epic A's PR, and nothing else. This plan's own PR is **not** in the budget — the grant is minted *from* the merged plan, so that merge happens before the grant exists and can never be paid for by it. It needs a one-off merge token of its own (below). Nothing further can merge until B–E have issues and the grant is re-minted. |
+| **What merging this plan authorizes** | Epics B (#77), C (#78), D (#79) and E (#80), in that order | Epic A (#70) is already merged. B–E now have issues, so the chain covers the rest of the Feature. |
+| **Merges** | 4 | Basis: one PR each for B, C, D and E. Epic A consumes nothing — it is done. This plan-update PR is **not** in the budget: a plan cannot authorize its own merge, so it takes a one-off merge token. |
 | **Epic verification** | `command` mode, running the named command below | The acceptance bar for every Epic here is "the HV4.3 env still builds". A command the hook runs on the PR's exact commit is stronger than a human eyeballing it, and it does not interrupt you. See §8 Q1 to override. |
 | **Owner steps during the run** | Three, total: (1) a one-off merge token for **this** PR, (2) mint the plan grant once it is merged, (3) re-mint to extend the chain once B–E have issues | There is no way to avoid (1): a plan cannot authorize its own merge. The exact invocation is handed to the owner privately, not recorded here. |
 | **Stops** | A failed verification breaks the chain until you re-mint. A used-up budget pauses the run and I ask, with the reason. | |
@@ -104,10 +106,10 @@ What merging this plan authorizes, in words:
 
 ```grant-terms
 {
-  "epic_chain": [70],
+  "epic_chain": [70, 77, 78, 79, 80],
   "chain": true,
   "verification": { "mode": "command", "command": "pio run -e heltec_v4_tft_companion_radio_usb_tcp_touch" },
-  "merge": { "budget": 1, "basis": "Epic A's PR only. This plan's own PR is excluded: the grant is minted from the merged plan, so that merge precedes the grant and takes a one-off merge token instead. B-E are not yet issues, so the grant is re-minted to extend the chain." },
+  "merge": { "budget": 4, "basis": "one PR each for Epics B (#77), C (#78), D (#79) and E (#80). Epic A (#70) is already merged and consumes nothing. This plan-update PR is excluded, as a plan cannot authorize its own merge." },
   "flash": null,
   "reset": null,
   "expires_after_hours": 168
