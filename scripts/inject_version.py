@@ -129,7 +129,8 @@ if sys.platform == "win32":
 # Write to scripts/build/ and force-include by BASENAME, NOT absolute path (a
 # ~90-char absolute $BUILD_DIR path on every compile line is itself part of the
 # overflow). Mirror inject_wifi_env.py: same out dir, on CPPPATH, bare -include.
-# scripts/build/ is gitignored (generated).
+# Only the generated header itself is gitignored here, not scripts/build/ — in
+# wadamesh that directory also holds tracked sources (gen-*.py, patch_*.py).
 _out_dir = os.path.join(env.subst("$PROJECT_DIR"), "scripts", "build")  # type: ignore[name-defined]  # noqa: F821
 os.makedirs(_out_dir, exist_ok=True)
 _hdr = os.path.join(_out_dir, "offband_patch_version.h")

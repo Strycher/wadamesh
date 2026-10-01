@@ -28,6 +28,14 @@ platformio.local.ini
 # Local tile-pack build data + generated Wi-Fi creds (never commit)
 /data/
 scripts/build/wifi_secrets.h
+# Generated per build by scripts/inject_version.py: the version strings plus
+# every pin/feature define it relocates off the compile command line. Its
+# contents are env-specific, so a tracked copy would be wrong for whichever
+# env was not built last. NOTE: do NOT widen this to `scripts/build/` — unlike
+# Offband (where inject_version.py came from, and whose comment still claims
+# the whole directory is ignored), scripts/build/ here holds real tracked
+# sources (gen-*.py, patch_*.py, i18n-*.py).
+scripts/build/offband_patch_version.h
 
 # Local working notes + agent config (contain ops/infra details — never publish)
 CLAUDE.md
