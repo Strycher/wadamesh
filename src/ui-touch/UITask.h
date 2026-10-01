@@ -249,6 +249,9 @@ private:
   bool looksLikeKnownChannel(const char* name) const;
 public:
   void refreshThreadsFromMesh();
+  /** Coex: end the boot-phase contacts-defer (see s_boot_defer_contacts in the .cpp).
+   *  Called from the main loop once WiFi has had its connect window, or after a timeout. */
+  void releaseBootContactDefer();
   /** Drop UI thread `idx` and any cached messages tied to it. Returns false
    *  if the index is out of range or the slot wasn't in use. Used by the
    *  long-press → Delete chat action; for channel threads, the caller is
