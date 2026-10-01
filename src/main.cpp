@@ -774,6 +774,47 @@ static void wioTrackerL2GpsProbe() {
 #endif  // HAS_WIO_TRACKER_L2 && WIO_TRACKER_L2_GPS_PROBE
 
 
+#if defined(ESP32) && (defined(WIFI_SSID) || defined(MULTI_TRANSPORT_COMPANION))
+// [Offband coex] Guarded WiFi.begin. The un-guarded esp_wifi_connect path
+// (scan_start -> esp_timer_create for the connect-timeout) aborts HARD with
+// ESP_ERR_NO_MEM when internal DRAM is too low — the exact boot crash-loop we hit
+// on beta_36 (WiFi enabled, contacts/UI already built, no room left for the connect).
+// beta_36's own guard only defers BLE and always calls WiFi.begin, so it can't stop
+// this. Gate the begin on real headroom: free heap AND largest contiguous block (the
+// driver needs a contiguous DMA-capable block, not just total free). Too tight -> skip
+// this pass; BLE stays up and a later loop pass retries once memory frees (e.g. after
+// the boot contacts-defer releases). This never aborts.
+static const size_t WIFI_CONNECT_MIN_FREE  = 48u * 1024u;
+static const size_t WIFI_CONNECT_MIN_BLOCK = 24u * 1024u;
+static void wifiBeginGuarded(const char* ssid, const char* pwd, const char* why) {
+  const size_t fh = ESP.getFreeHeap(), mb = ESP.getMaxAllocHeap();
+  if (fh >= WIFI_CONNECT_MIN_FREE && mb >= WIFI_CONNECT_MIN_BLOCK) {
+    Serial.printf("[coex] WiFi.begin(%s) free=%u maxblk=%u -> proceeding\n", why, (unsigned)fh, (unsigned)mb);
+    WiFi.begin(ssid, (pwd && pwd[0]) ? pwd : nullptr);
+  } else {
+    Serial.printf("[coex] WiFi.begin(%s) DEFERRED low-heap free=%u maxblk=%u (need free>=%u blk>=%u) -> BLE stays up\n",
+                  why, (unsigned)fh, (unsigned)mb, (unsigned)WIFI_CONNECT_MIN_FREE, (unsigned)WIFI_CONNECT_MIN_BLOCK);
+  }
+}
+#endif
+
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && defined(BLE_PIN_CODE)
+// [Offband coex] WiFi-first BLE start. BLE is intentionally NOT co-init'd at boot when
+// WiFi is also wanted (see setup()); starting BLE first fragments internal DRAM so the
+// WiFi connect can't get its contiguous block. Start BLE HERE instead — once WiFi has
+// associated (heap has settled around WiFi's buffers), or after a timeout if WiFi never
+// connects (BLE-anyway; WiFi stays down, no reboot). prepareBle() already stashed the
+// params at boot, so this is the same path the live BLE toggle uses (known to work).
+static bool g_ble_start_pending = false;
+static void bleStartIfPending(const char* why) {
+  if (!g_ble_start_pending) return;
+  g_ble_start_pending = false;
+  Serial.printf("[coex] starting BLE (%s) free=%u maxblk=%u\n", why,
+                (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+  serial_interface.beginBle(BLE_NAME_PREFIX, the_mesh.getNodePrefs()->node_name, the_mesh.getBLEPin());
+}
+#endif
+
 void setup() {
   Serial.begin(115200);
 #if defined(HAS_RAK_TAP_V2)
@@ -1656,15 +1697,19 @@ void setup() {
   }
 #else
   if (wifiConfigGetBleEnabled()) {
-    const size_t BLE_COEXIST_MIN_FREE  = 50 * 1024;   // free heap after Wi-Fi to also start BLE
-    const size_t BLE_COEXIST_MIN_BLOCK = 20 * 1024;   // largest contiguous block (NimBLE controller/host)
-    const size_t freeh  = ESP.getFreeHeap();
-    const size_t maxblk = ESP.getMaxAllocHeap();
-    if (!want_wifi || (freeh >= BLE_COEXIST_MIN_FREE && maxblk >= BLE_COEXIST_MIN_BLOCK)) {
-      serial_interface.beginBle(BLE_NAME_PREFIX, the_mesh.getNodePrefs()->node_name, the_mesh.getBLEPin());
-      Serial.printf("[boot] BLE co-init OK (wifi=%d free=%u maxblk=%u)\n", (int)want_wifi, (unsigned)freeh, (unsigned)maxblk);
+    if (want_wifi) {
+      // [Offband coex] WiFi-first ordering: do NOT co-init BLE at boot when WiFi is also
+      // wanted. Bringing BLE up first claims ~45KB and fragments internal DRAM, so the
+      // WiFi connect (esp_wifi_connect -> scan_start) can't get its contiguous block —
+      // that's the "WiFi won't associate with BLE enabled" failure. Defer BLE to loop():
+      // start it once WiFi has associated (bleStartIfPending), or after a timeout if WiFi
+      // never comes up. Automates the manual "BLE off, reboot, WiFi connects, enable BLE".
+      g_ble_start_pending = true;
+      Serial.printf("[coex] BLE deferred at boot (WiFi-first) — start on WiFi connect or timeout\n");
     } else {
-      Serial.printf("[boot] BLE deferred: low heap (free=%u maxblk=%u) — Wi-Fi only\n", (unsigned)freeh, (unsigned)maxblk);
+      // BLE-only (no WiFi wanted): bring BLE up now; no coex heap contention.
+      serial_interface.beginBle(BLE_NAME_PREFIX, the_mesh.getNodePrefs()->node_name, the_mesh.getBLEPin());
+      Serial.printf("[boot] BLE co-init (BLE-only, no WiFi)\n");
     }
   }
 #endif
@@ -1905,6 +1950,10 @@ void loop() {
     uint32_t _uidt = millis() - _ui0;
     if (_uidt >= 200) stallLog((g_ui_stall_max >= 150 && g_ui_stall_tag[0]) ? g_ui_stall_tag : "ui:other", _uidt);
   }
+  // Coex: release the boot contacts-defer after a grace window even if WiFi never
+  // associates (no creds / AP down), so the Contacts tab can't stay permanently empty.
+  { static bool s_boot_defer_released = false;
+    if (!s_boot_defer_released && millis() > 20000) { s_boot_defer_released = true; ui_task.releaseBootContactDefer(); } }
 #endif
 #ifdef MULTI_TRANSPORT_COMPANION
 #ifdef DISPLAY_CLASS
@@ -2085,7 +2134,11 @@ void loop() {
 #if defined(TLORA_PAGER) && defined(BLE_PIN_CODE)
           wifiConfigSetPagerWifiBlePhase(PagerWifiBlePhase::Associating);
 #endif
-          WiFi.begin(ssid, pwd[0] ? pwd : nullptr);
+          // [Offband coex] Upstream's raw WiFi.begin() replaced by the heap-guarded
+          // wrapper: the un-guarded esp_wifi_connect path aborts HARD with
+          // ESP_ERR_NO_MEM when internal DRAM is low. Upstream's WL_CONNECTED check
+          // and the pager phase call are kept as-is.
+          wifiBeginGuarded(ssid, pwd, "initial");
         }
         last_wifi_retry_ms = millis();
 #if defined(TLORA_PAGER) && defined(BLE_PIN_CODE)
@@ -2147,7 +2200,7 @@ void loop() {
           // beacon loss) can be a no-op — clear its state first so this forces a
           // fresh association. Backs up setAutoReconnect(true) for the stuck case.
           WiFi.disconnect(false, true);
-          WiFi.begin(ssid, pwd[0] ? pwd : nullptr);
+          wifiBeginGuarded(ssid, pwd, "retry");
         }
       }
     }
@@ -2155,6 +2208,13 @@ void loop() {
      * into the mesh RTC so timestamps on messages are accurate. */
     static bool sntp_kicked = false;
     static bool sntp_pushed = false;
+    static uint32_t sntp_kick_ms = 0;
+    // [Offband coex] WiFi-first timeout: if WiFi hasn't associated within the window,
+    // bring BLE up anyway (user accepts WiFi may stay down; no reboot). Mirrors the
+    // WiFi-connect path — either way BLE ends up running; this just bounds the wait.
+#if defined(BLE_PIN_CODE)
+    if (g_ble_start_pending && millis() > 20000) bleStartIfPending("wifi-timeout");
+#endif
     if (WiFi.status() == WL_CONNECTED) {
 #if defined(TLORA_PAGER) && defined(BLE_PIN_CODE)
       wifiConfigSetPagerWifiBlePhase(PagerWifiBlePhase::Connected);
@@ -2196,8 +2256,18 @@ void loop() {
       // accounting for 0.3% of it. So there is nothing to trade away here.
       static bool modem_sleep_set = false;
       if (!modem_sleep_set) {
-        WiFi.setSleep(true);
-        modem_sleep_set = true;
+        WiFi.setSleep(true); modem_sleep_set = true;
+        // Coex checkpoint: BLE up + WiFi just associated — this heap is the real
+        // BLE+WiFi steady-state headroom. Release the boot contacts-defer now that
+        // WiFi has claimed its buffers (lets the deferred 44KB contact build run).
+        Serial.printf("[coex] wifi:connected free=%u maxblk=%u\n",
+                      (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+#ifdef DISPLAY_CLASS
+        ui_task.releaseBootContactDefer();
+#endif
+#if defined(BLE_PIN_CODE)
+        bleStartIfPending("wifi-connected");   // WiFi-first: BLE comes up now that WiFi has its buffers
+#endif
       }
       if (!sntp_kicked) {
         /* Brussels timezone with DST rules baked in (POSIX "CET-1CEST,...").

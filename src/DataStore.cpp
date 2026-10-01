@@ -498,6 +498,7 @@ void DataStore::loadContacts(DataStoreHost* host) {
 File file = openRead(_getContactsChannelsFS(), "/contacts3");
     if (file) {
       bool full = false;
+      int loaded = 0;
       while (!full) {
         ContactInfo c;
         uint8_t pub_key[32];
@@ -522,7 +523,22 @@ File file = openRead(_getContactsChannelsFS(), "/contacts3");
         // save walked the raw table, which 1.17 had shifted), so an upgrade from
         // it carries up to MAX_ANON_CONTACTS empty entries that would otherwise
         // load as real, nameless contacts. The next save drops them for good.
+        // Ordered BEFORE the cap clamp on purpose: a blank must not consume a
+        // slot of the MAX_CONTACTS budget.
         if (c.type == ADV_TYPE_NONE || !c.name[0]) continue;
+
+        // Clamp the load to the configured cap. A /contacts3 written under a HIGHER
+        // MAX_CONTACTS (e.g. after lowering the cap) holds more records than the
+        // array now allows; feeding the surplus in churns the host's overwrite-
+        // oldest-when-full path during boot and faults (reason=4 boot loop). Keep
+        // the first MAX_CONTACTS records and stop — dropping the surplus is the
+        // intended consequence of a smaller cap. The next saveContacts() then
+        // rewrites the file at the new size. (Latent bug: the loader never bounded
+        // to MAX_CONTACTS; it only ever mattered once the cap was lowered.)
+        // This fork runs MAX_CONTACTS=300 where the fork-of-origin used 2000, so
+        // the lowered-cap case is live here, not hypothetical.
+        if (loaded >= MAX_CONTACTS) break;
+        loaded++;
 
         c.id = mesh::Identity(pub_key);
         if (!host->onContactLoaded(c)) full = true;
