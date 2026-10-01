@@ -13,6 +13,9 @@
 #include <esp_partition.h>   // find/erase otadata so the bootloader returns to the recovery
 #include <helpers/TouchDiagTrace.h>
 #include <helpers/MeshTouchTxTrace.h>
+#include "helpers/WmTrace.h"                 // WM_TRACE_LEVEL-gated tracing (#61).
+                                             // Header only; defaults to level 0, so the
+                                             // macros compile out unless a build enables it.
 #include "helpers/esp32/TouchPrefsStore.h"   // QUOTED: get wadamesh's copy (touchPrefsReload), not the lib's stale one
 #include "helpers/esp32/SdNvsPrefs.h"        // route prefs to file storage (SD/SPIFFS), off NVS
                                              // (quoted: use wadamesh's src/ copy, not the lib's stale one)
@@ -779,6 +782,31 @@ void setup() {
   delay(200);
 #endif
   Serial.println("[BOOT] setup start");
+  // WHY THIS EXISTS (#61): this board's console is native USB CDC, but the ROM
+  // prints its reset reason ("rst:0x..") on UART0 — so that line NEVER reaches
+  // our capture. Two spontaneous reboots (38.5min, 24.1min uptime) showed zero
+  // fault markers in the log, which was not evidence of a clean restart, only
+  // evidence that we were blind to the cause. esp_reset_reason() is readable
+  // from the firmware and answers it directly: POWERON/EXT mean someone pressed
+  // reset; PANIC/INT_WDT/TASK_WDT/BROWNOUT mean the firmware or the supply did.
+  {
+    const esp_reset_reason_t rr = esp_reset_reason();
+    const char* why = "?";
+    switch (rr) {
+      case ESP_RST_POWERON:  why = "POWERON (power applied / RST button)"; break;
+      case ESP_RST_EXT:      why = "EXT (external reset pin)";             break;
+      case ESP_RST_SW:       why = "SW (esp_restart)";                     break;
+      case ESP_RST_PANIC:    why = "PANIC (exception / abort)";            break;
+      case ESP_RST_INT_WDT:  why = "INT_WDT (interrupt watchdog)";         break;
+      case ESP_RST_TASK_WDT: why = "TASK_WDT (task watchdog)";             break;
+      case ESP_RST_WDT:      why = "WDT (other watchdog)";                 break;
+      case ESP_RST_DEEPSLEEP:why = "DEEPSLEEP wake";                       break;
+      case ESP_RST_BROWNOUT: why = "BROWNOUT (supply sagged)";             break;
+      case ESP_RST_SDIO:     why = "SDIO";                                 break;
+      default:               why = "UNKNOWN";                              break;
+    }
+    Serial.printf("[BOOT] reset reason: %s (%d)\n", why, (int)rr);
+  }
   // The SDK ships CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096: every allocation
   // under 4 KB is forced into internal DRAM even when PSRAM is free. On the V4
   // that is why internal sat at ~99% while 800+ KB of PSRAM went unused. Lower
@@ -1702,6 +1730,143 @@ void setup() {
   wioTrackerL2GpsProbe();   // TEMP DIAGNOSTIC — must precede sensors.begin()'s Serial1.begin()
 #endif
   sensors.begin();
+
+  // ---- #61: name what is actually on the sensor I2C bus -------------------
+  // MeshCore logs its sensor table walk with MESH_DEBUG_PRINTLN, and MESH_DEBUG
+  // is not defined in this build — so every boot so far has reported NOTHING
+  // about which sensors were found or registered. querySensors() then walks a
+  // table of bare function pointers with no names, so a hang there is
+  // unattributable. This scan is the missing half: it names every device that
+  // ACKs, so a wedge inside querySensors() can be tied to a real chip.
+  //
+  // NOTE the address collisions in MeshCore's SENSOR_TABLE: 0x76 is claimed by
+  // BME680, BME280 AND BMP280; 0x44 by both SHT4X and INA226. Every driver whose
+  // address ACKs gets registered, so ONE physical chip can end up with TWO
+  // drivers issuing unrelated transactions to it.
+  // Defaults so an env that simply omits a flag is treated as "driver absent"
+  // rather than silently skipped from the collision check.
+  #ifndef ENV_INCLUDE_BME680
+    #define ENV_INCLUDE_BME680 0
+  #endif
+  #ifndef ENV_INCLUDE_BME280
+    #define ENV_INCLUDE_BME280 0
+  #endif
+  #ifndef ENV_INCLUDE_BMP280
+    #define ENV_INCLUDE_BMP280 0
+  #endif
+  #ifndef ENV_INCLUDE_BMP085
+    #define ENV_INCLUDE_BMP085 0
+  #endif
+  #ifndef ENV_INCLUDE_SHTC3
+    #define ENV_INCLUDE_SHTC3 0
+  #endif
+  #ifndef ENV_INCLUDE_SHT4X
+    #define ENV_INCLUDE_SHT4X 0
+  #endif
+  #ifndef ENV_INCLUDE_LPS22HB
+    #define ENV_INCLUDE_LPS22HB 0
+  #endif
+  #ifndef ENV_INCLUDE_INA3221
+    #define ENV_INCLUDE_INA3221 0
+  #endif
+  #ifndef ENV_INCLUDE_INA219
+    #define ENV_INCLUDE_INA219 0
+  #endif
+  #ifndef ENV_INCLUDE_INA260
+    #define ENV_INCLUDE_INA260 0
+  #endif
+  #ifndef ENV_INCLUDE_INA226
+    #define ENV_INCLUDE_INA226 0
+  #endif
+  #ifndef ENV_INCLUDE_MLX90614
+    #define ENV_INCLUDE_MLX90614 0
+  #endif
+  #ifndef ENV_INCLUDE_VL53L0X
+    #define ENV_INCLUDE_VL53L0X 0
+  #endif
+  #ifndef ENV_INCLUDE_RAK12035
+    #define ENV_INCLUDE_RAK12035 0
+  #endif
+  {
+    // Address -> driver claims, filtered by what this build actually compiled.
+    // `enabled` mirrors MeshCore's SENSOR_TABLE gating, so the report describes
+    // THIS firmware rather than the superset of drivers that exist.
+    struct Claim { uint8_t addr; const char* name; bool enabled; };
+    static const Claim kClaims[] = {
+      { 0x76, "BME680",   ENV_INCLUDE_BME680   },
+      { 0x76, "BME280",   ENV_INCLUDE_BME280   },
+      { 0x76, "BMP280",   ENV_INCLUDE_BMP280   },
+      { 0x77, "BMP085",   ENV_INCLUDE_BMP085   },
+      { 0x70, "SHTC3",    ENV_INCLUDE_SHTC3    },
+      { 0x44, "SHT4X",    ENV_INCLUDE_SHT4X    },
+      { 0x44, "INA226",   ENV_INCLUDE_INA226   },
+      { 0x5C, "LPS22HB",  ENV_INCLUDE_LPS22HB  },
+      { 0x42, "INA3221",  ENV_INCLUDE_INA3221  },
+      { 0x40, "INA219",   ENV_INCLUDE_INA219   },
+      { 0x41, "INA260",   ENV_INCLUDE_INA260   },
+      { 0x5A, "MLX90614", ENV_INCLUDE_MLX90614 },
+      { 0x29, "VL53L0X",  ENV_INCLUDE_VL53L0X  },
+      { 0x20, "RAK12035", ENV_INCLUDE_RAK12035 },
+    };
+    // Addresses this firmware reads itself, outside MeshCore's SENSOR_TABLE.
+    struct Ours { uint8_t addr; const char* name; };
+    static const Ours kOurs[] = {
+      { 0x2E, "CHSC6x touch (HeltecV4CapTouch)" },
+#if defined(HELTEC_LORA_V4_R8)
+      { 0x70, "SHTC3 (WmShtc3, bounded — #61)" },
+#endif
+    };
+
+    int found = 0, collisions = 0;
+    WM_LOG(1, "[I2CSCAN] scanning sensor bus (TELEM_WIRE = Wire)");
+    for (uint8_t a = 0x08; a < 0x78; a++) {
+      Wire.beginTransmission(a);
+      if (Wire.endTransmission() != 0) continue;
+      found++;
+
+      // Which ENABLED SENSOR_TABLE drivers claim this address?
+      char who[96]; who[0] = '\0';
+      int n_enabled = 0;
+      for (auto& c : kClaims) {
+        if (c.addr != a || !c.enabled) continue;
+        if (n_enabled++) strncat(who, " + ", sizeof who - strlen(who) - 1);
+        strncat(who, c.name, sizeof who - strlen(who) - 1);
+      }
+      const char* ours = nullptr;
+      for (auto& o : kOurs) if (o.addr == a) { ours = o.name; break; }
+
+      if (n_enabled > 1) {
+        // #62: MeshCore registers EVERY table entry whose address ACKs — no
+        // first-match-wins, no chip-ID check. Two drivers will issue unrelated
+        // register traffic to one chip. Loud, because it is silent upstream.
+        collisions++;
+        WM_LOG(1, "[I2CSCAN] 0x%02X ACK  -> COLLISION: %d enabled drivers claim it (%s)",
+               a, n_enabled, who);
+      } else if (n_enabled == 1) {
+        WM_LOG(1, "[I2CSCAN] 0x%02X ACK  -> %s", a, who);
+      } else if (ours) {
+        WM_LOG(1, "[I2CSCAN] 0x%02X ACK  -> %s", a, ours);
+      } else {
+        WM_LOG(1, "[I2CSCAN] 0x%02X ACK  -> present, no enabled driver", a);
+      }
+    }
+
+    // Drivers compiled in whose part did not answer. Not fatal — but it means
+    // dead weight in the build and, on a collision address, a driver that could
+    // grab a chip it does not own if that chip ever appears.
+    for (auto& c : kClaims) {
+      if (!c.enabled) continue;
+      Wire.beginTransmission(c.addr);
+      if (Wire.endTransmission() == 0) continue;
+      WM_LOG(1, "[I2CSCAN] %s enabled but nothing at 0x%02X", c.name, c.addr);
+    }
+
+    WM_LOG(1, "[I2CSCAN] %d device(s), %d address collision(s)", found, collisions);
+    if (collisions) {
+      WM_LOG(1, "[I2CSCAN] see #62 — disable the drivers for parts not fitted "
+                "(-D ENV_INCLUDE_<PART>=0) or they will fight over the chip");
+    }
+  }
 
 #ifdef DISPLAY_CLASS
   ui_task.begin(disp, &sensors, the_mesh.getNodePrefs());  // still want to pass this in as dependency, as prefs might be moved

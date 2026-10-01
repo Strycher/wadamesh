@@ -9,6 +9,19 @@ void HeltecV4Board::begin() {
     digitalWrite(PIN_ADC_CTRL, LOW); // Initially inactive
 #endif  // V4-R8: no ADC-control MOSFET — the battery divider is read directly
 
+    // Battery ADC attenuation. Meshtastic's heltec_v4 variant sets
+    // ADC_ATTEN_DB_2_5 explicitly, commented "lower dB for high resistance
+    // voltage divider" — this divider is high-impedance and the S3's ADC is at
+    // its worst (most non-linear) near the top of the 11 dB range, which is
+    // exactly where a charged cell sits. We previously set NO attenuation at
+    // all, inheriting Arduino's 11 dB default while getBattMilliVolts()
+    // converted with a linear 3.3 V full-scale assumption — so both the scale
+    // and the linearity were wrong. (#58)
+    // Headroom check: divider output at a full 4.2 V cell is ~820 mV on the V4
+    // (÷5.12) and ~830 mV on the R8 (÷5.07), both comfortably inside 2.5 dB
+    // full-scale (~1250 mV on ESP32-S3), so nothing clips.
+    analogSetPinAttenuation(PIN_VBAT_READ, ADC_2_5db);
+
     loRaFEMControl.init();
 
 #if defined(HELTEC_V4_EXPANSION_IO_PIN) && !defined(HELTEC_LORA_V4_R8)
@@ -110,20 +123,30 @@ void HeltecV4Board::begin() {
     for (int i = 0; i < 8; i++) mv += analogReadMilliVolts(PIN_VBAT_READ);
     return (uint16_t)((mv / 8) * adc_mult);
 #else
-    analogReadResolution(10);
+    // Non-R8 V4 (incl. the HV4.3 TFT): beta_85 fixed only the R8 branch above
+    // and left this one on the uncalibrated raw*(3.3/1024) read. The same
+    // argument applies here, so #58's calibrated path is kept for the rest of
+    // the V4 family (see 6ac6dfd, "both V4 and V4-R8").
 #if defined(PIN_ADC_CTRL) && PIN_ADC_CTRL >= 0
     digitalWrite(PIN_ADC_CTRL, HIGH);   // enable the battery divider
     delay(10);
 #endif
-    uint32_t raw = 0;
+    // Read CALIBRATED millivolts rather than raw counts. analogReadMilliVolts()
+    // applies the chip's eFuse ADC calibration for the configured attenuation
+    // (set to 2.5 dB in begin()), which removes both the full-scale guess and
+    // the S3 ADC's non-linearity. The old path was:
+    //     analogReadResolution(10); raw = analogRead(); (adc_mult * 3.3/1024 * raw)
+    // which hardcoded a 3.3 V full scale that did not match the attenuation in
+    // force, and treated a non-linear ADC as linear. (#58)
+    uint32_t mv_sum = 0;
     for (int i = 0; i < 8; i++) {
-      raw += analogRead(PIN_VBAT_READ);
+      mv_sum += analogReadMilliVolts(PIN_VBAT_READ);
     }
-    raw = raw / 8;
+    const uint32_t pin_mv = mv_sum / 8;   // millivolts at the divider tap
 #if defined(PIN_ADC_CTRL) && PIN_ADC_CTRL >= 0
     digitalWrite(PIN_ADC_CTRL, LOW);
 #endif
-    return (adc_mult * (3.3 / 1024.0) * raw) * 1000;
+    return (uint16_t)(adc_mult * (float)pin_mv);   // scale back up to cell volts
 #endif
   }
 
