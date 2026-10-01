@@ -7,7 +7,26 @@
 #include "LoRaFEMControl.h"
 
 #ifndef ADC_MULTIPLIER
-  #define ADC_MULTIPLIER 5.42
+  // Battery divider ratio for the Heltec V4 family = 4.9.
+  //
+  // VERIFIED against Heltec's own V4-R8 schematic (HTIT-WBR8H_V4.3.2.pdf,
+  // resource.heltec.cn): VBAT -> R27 390K -> ADC_IN -> R28 100K -> GND, with NO
+  // series switch. (390+100)/100 = 4.9. Heltec's V4 documentation gives the same
+  // 390K/100K pair, so V4 and V4-R8 share the divider.
+  //
+  // Was 5.42, which reads ~10% high. Combined with the missing ADC attenuation
+  // (see begin()), a 3.85 V cell computed to ~4.5 V — above "full" — so the
+  // reading sat pinned at 100% and appeared frozen. The V4 TFT env never defines
+  // ADC_MULTIPLIER, so this fallback is what that board actually used. (#58)
+  //
+  // NOT 4.9 * 1.045: Meshtastic's 1.045 compensates for THEIR uncalibrated
+  // analogRead() path. getBattMilliVolts() now uses analogReadMilliVolts(),
+  // which already applies the chip's eFuse calibration, so the fudge factor
+  // would double-correct and over-read by ~4.5%.
+  //
+  // NOTE: the V4-R8 env defines its own 5.07 and is unaffected by this value —
+  // that 5.07 is ~3.5% off the schematic-true 4.9 and should follow (#58).
+  #define ADC_MULTIPLIER (4.9f)
 #endif
 
 class HeltecV4Board : public ESP32Board {
