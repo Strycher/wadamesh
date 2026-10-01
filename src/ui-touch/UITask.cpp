@@ -41221,9 +41221,18 @@ static bool ctRefreshRowsInPlace() {
   return true;
 }
 
+// Boot-phase contacts-defer (coex): the eager contact-list build (up to 128 LVGL rows)
+// is the largest internal-DRAM consumer during boot, and boot is exactly when WiFi wants
+// its ~45KB for the BLE+WiFi coexistence connect. So we DEFER every contacts build until
+// releaseBootContactDefer() fires (once WiFi has had its connect window, or a timeout).
+// During the defer, refreshContactsList() is a no-op that just records a pending build.
+static bool s_boot_defer_contacts    = true;
+static bool s_contacts_build_pending = false;
+
 static void refreshContactsList() {
   if (!g_lv.contacts_list || !g_lv.task) return;
   if (s_ctd_active) return;   // mid bulk-delete: don't rebuild rows under the progress modal
+  if (s_boot_defer_contacts) { s_contacts_build_pending = true; return; }   // coex: no contacts build during the boot/WiFi-connect window
   // Cache: skip the rebuild unless the count / filter / sort / search
   // changed, or 30 seconds have elapsed (so age labels re-render).
   static int     s_last_count  = -1;
@@ -41618,6 +41627,21 @@ static void refreshContactsList() {
 
 static void refreshThreadLists() {
   refreshChatList(g_lv.dm);
+}
+
+// Coex: end the boot-phase contacts defer (see s_boot_defer_contacts). Called from the
+// main loop once WiFi has had its connect window (associated, or a timeout). After this,
+// refreshContactsList() works normally. If we're currently ON the Contacts tab, build it
+// once now; otherwise leave it lazy — it builds on the next switch into Contacts.
+void UITask::releaseBootContactDefer() {
+  if (!s_boot_defer_contacts) return;
+  s_boot_defer_contacts = false;
+  if (s_contacts_build_pending) {
+    s_contacts_build_pending = false;
+    if (g_lv.tabview && lv_tabview_get_tab_act(g_lv.tabview) == CONTACTS_TAB_INDEX) {
+      refreshContactsList();
+    }
+  }
 }
 
 // Rolling diagnostic log
