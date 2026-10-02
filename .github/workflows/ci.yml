@@ -33,6 +33,13 @@ jobs:
           - LilyGo_TDeck_companion_radio_touch
           - ThinkNode_M9_companion_radio_touch
           - rak_tap_v2_companion_radio_touch
+          # ESP32-P4, pioarduino hybrid (arduino as an IDF component). Slower and
+          # heavier than the S3 envs: it pulls its own platform, IDF 5.5 and a
+          # ~900 MB riscv32 toolchain, none of which the other envs share. Added
+          # here so regressions show up, but deliberately NOT a required status
+          # check on main until it has proven itself over a few runs — a required
+          # context that never reports blocks every PR forever (#79).
+          - crowpanel7_companion_radio_touch
     steps:
       - uses: actions/checkout@v4
         with:
