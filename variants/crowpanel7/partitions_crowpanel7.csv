@@ -1,0 +1,23 @@
+# CrowPanel Advance 7 (ESP32-P4) — 16 MB standalone layout, mirroring the
+# Heltec V4 TFT table (partitions_tft_touch.csv): two equal OTA app slots,
+# LittleFS "tiles" partition for the map tile cache, spiffs for user data.
+# P4 note: the bootloader lives at 0x2000 on this chip (vs 0x0 on the S3);
+# the partition table itself still sits at 0x8000 and these offsets are
+# unchanged.
+#
+#   0x009000–0x00E000  nvs      (20 KB)
+#   0x00E000–0x010000  otadata  (8 KB)
+#   0x010000–0x3F0000  app0     (3.875 MB, ota_0)
+#   0x3F0000–0x7D0000  app1     (3.875 MB, ota_1)
+#   0x7D0000–0xC90000  tiles    (4.75 MB, LittleFS, type 0x83)
+#   0xC90000–0xFF0000  spiffs   (3.375 MB)
+#   0xFF0000–0x1000000 coredump (64 KB)
+
+# Name,   Type, SubType,  Offset,   Size,     Flags
+nvs,      data, nvs,      0x9000,   0x5000,
+otadata,  data, ota,      0xe000,   0x2000,
+app0,     app,  ota_0,    0x10000,  0x3E0000,
+app1,     app,  ota_1,    0x3F0000, 0x3E0000,
+tiles,    data, 0x83,     0x7D0000, 0x4C0000,
+spiffs,   data, spiffs,   0xC90000, 0x360000,
+coredump, data, coredump, 0xFF0000, 0x10000,
