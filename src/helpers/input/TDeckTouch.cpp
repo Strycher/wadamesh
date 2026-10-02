@@ -7,7 +7,11 @@
 // driver outputs coordinates already in the 320x240 landscape screen space.
 // The raw->screen mapping is calibrated against the panel; flip the TDECK_TS_*
 // switches below if taps land mirrored/rotated.
-#if defined(HAS_TOUCH_UI) && !defined(HAS_HELTEC_V4_CAP_TOUCH) && !defined(HAS_RAK_TAP_V2) && defined(ESP32)
+// Each exclusion names a board that brings its own touch driver and would
+// otherwise collide at link with this default fallback: HELTEC_V4_CAP_TOUCH and
+// RAK_TAP_V2 from upstream, HAS_CROWPANEL7 for the GT911 driver in
+// variants/crowpanel7/CrowPanel7Touch.cpp.
+#if defined(HAS_TOUCH_UI) && !defined(HAS_HELTEC_V4_CAP_TOUCH) && !defined(HAS_RAK_TAP_V2) && !defined(HAS_CROWPANEL7) && defined(ESP32)
 
 #include "HeltecV4CapTouch.h"
 #include "TDeckKeyboard.h"                 // shares this I2C bus; polled from the touch task

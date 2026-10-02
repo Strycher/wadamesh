@@ -1,6 +1,15 @@
 #include <Arduino.h>   // needed for PlatformIO
 #include <Mesh.h>
 #include "MyMesh.h"
+// Offband observability (#13 RTC ring, #19 TF-card log). CrowPanel7-only for now:
+// the sources are in this env's build_src_filter only, so the calls MUST be gated
+// or the S3 touch builds fail to link. CrashLog is generic-ESP32 and would benefit
+// the S3 fleet too — enabling it there is a deliberate behaviour change (4KB RTC +
+// esp_log hook + boot dump) and needs the owner's call, so it is NOT done here.
+#if defined(HAS_CROWPANEL7)
+  #include "helpers/offband/CrashLog.h"
+  #include "helpers/offband/SdLog.h"
+#endif
 #if defined(ESP32_PLATFORM)
   #include <new>               // placement-new for the PSRAM-resident the_mesh
   #include "esp_heap_caps.h"   // heap_caps_malloc(MALLOC_CAP_SPIRAM)
@@ -73,6 +82,8 @@ static uint32_t _atoi(const char* sp) {
         #define PIN_SD_CS 39    // T-Deck microSD chip-select (V4-R8 sets 3 in the env)
       #endif
     #endif
+  #elif defined(HAS_CROWPANEL7)
+    #include <SD_MMC.h>   // #27: churn-heavy contacts/channels ride the TF card
   #endif
   extern "C" void set_boot_phase(int phase);
   namespace { struct MainBootTrace { MainBootTrace() { set_boot_phase(2); } } _main_boot_trace; }
@@ -249,7 +260,23 @@ bool g_sd_migration_blocked = false;
 
 
 void halt() {
-  while (1) ;
+  // Was a bare silent while(1) — a SAFELANE §6 violation: a halt with no
+  // reason erases the very evidence needed to diagnose it. Surface it loudly
+  // and keep re-emitting so a monitor attached late still catches it (#13).
+#if defined(HAS_CROWPANEL7)
+  offband::crashLogf("[HALT] setup aborted — spinning. See boot log above for cause.");
+#else
+  Serial.println("[HALT] setup aborted — spinning. See boot log above for cause.");
+#endif
+  Serial.flush();
+  uint32_t last = 0;
+  while (1) {
+    if (millis() - last >= 3000) {   // heartbeat so late-attached monitors see it
+      last = millis();
+      Serial.println("[HALT] node halted in setup() (radio/init failure). Power-cycle after fixing.");
+    }
+    delay(50);
+  }
 }
 
 /* WIFI RECONNECT TRACKERS */
@@ -822,7 +849,16 @@ void setup() {
 #else
   delay(200);
 #endif
+  // FIRST: recover the previous boot's log (survives WDT/panic/brownout in
+  // RTC_NOINIT) and install the esp_log capture hook, so nothing boot-time is
+  // lost to monitor-attach latency. SAFELANE §6 no-silent-failures (#13).
+#if defined(HAS_CROWPANEL7)
+  offband::crashLogBegin();
+  offband::crashLogf("[BOOT] setup start (reset=%s)",
+                     offband::resetReasonString(esp_reset_reason()));
+#else
   Serial.println("[BOOT] setup start");
+#endif
   // WHY THIS EXISTS (#61): this board's console is native USB CDC, but the ROM
   // prints its reset reason ("rst:0x..") on UART0 — so that line NEVER reaches
   // our capture. Two spontaneous reboots (38.5min, 24.1min uptime) showed zero
@@ -863,8 +899,24 @@ void setup() {
   // CPU1=IDLE1, core 0 in spi_flash_op_block_func). The burst can't be chunked under the limit easily
   // and the per-core WdtHeavyGuard only covers core 0, so give the dog enough headroom to ride the
   // burst out while still catching a genuine multi-second hang. (Fixes the random WDT reboots, GH #56.)
+#if ESP_IDF_VERSION_MAJOR >= 5
+  // IDF 5 (P4 hybrid build): the int/bool init() is gone and the TWDT is already
+  // running (started by arduino), so reconfigure it in place — same 20 s + panic.
+  // idle_core_mask MUST be 0x1 (IDLE0 only), matching arduino's S3 default:
+  // wadamesh's loopTask spins CPU1 without yielding BY DESIGN, so IDLE1 never
+  // runs. Watching IDLE1 (first P4 bring-up did, mask 0x3) reboots the node
+  // 20-45 s into any session — the "random" config-flow crashes in #12.
+  {
+    esp_task_wdt_config_t twdt_cfg = {};
+    twdt_cfg.timeout_ms = 20000;
+    twdt_cfg.idle_core_mask = 0x1;   // IDLE0 only — never IDLE1 (see above)
+    twdt_cfg.trigger_panic = true;
+    esp_task_wdt_reconfigure(&twdt_cfg);
+  }
+#else
   esp_task_wdt_init(20, true);   // 20 s grace (was ~5 s), keep panic. Re-init reconfigures the
                                  // already-running TWDT + keeps the idle-task subscriptions.
+#endif
 
 #if defined(ESP32_PLATFORM) && defined(HAS_TOUCH_UI)
   // Record which slot we booted from so the recovery's "Boot firmware" can return
@@ -913,6 +965,16 @@ void setup() {
     Serial.printf("[BOOT] psram probe: %s\n", psram_ok ? "OK" : "FAIL"); Serial.flush();
     if (!psram_ok) { Serial.println("[BOOT] FATAL: PSRAM readback mismatch — halting"); halt(); }
   }
+#endif
+
+  // TF/microSD persistent log (#19). AFTER board.begin() so the rails are up and
+  // AFTER crashLogBegin() (which stashed the previous boot's log) — this writes
+  // that post-mortem to the card so it survives a power cycle and can be read by
+  // pulling the card, with no serial monitor ever attached (#18).
+  // No-op on boards without it; never fatal, never hangs boot with no card.
+#if defined(HAS_CROWPANEL7)
+  offband::sdLogBegin();
+  Serial.printf("[BOOT] sd log: %s\n", offband::sdLogStatus());
 #endif
 
 #ifdef DISPLAY_CLASS
@@ -1396,6 +1458,23 @@ void setup() {
         Serial.println("[BOOT] contacts/channels -> SD card (identity/prefs stay on SPIFFS)");
       }
     }
+  }
+#elif defined(HAS_CROWPANEL7)
+  // CrowPanel7 (#27): same churn problem as the T-Deck branch above, different
+  // symptom. Every internal-flash write briefly whites the DSI panel (a flash
+  // erase disables the shared flash/PSRAM cache, starving the framebuffer — #20),
+  // and the DataStore rewrites contacts/channels constantly. Route just those to
+  // the TF card; identity + prefs deliberately STAY on internal flash, so the node
+  // identity never changes and the device is safe if the card is pulled.
+  // DataStore::begin() -> migrateToSecondaryFS() copies the existing SPIFFS
+  // contacts/channels across once, so the contact list is preserved.
+  // The card is already mounted at boot by offband::sdLogBegin() (SD_MMC), so no
+  // mount ladder is needed here — just check it came up.
+  if (offband::sdLogAvailable()) {
+    store.setSecondaryFS(&SD_MMC);
+    Serial.println("[BOOT] contacts/channels -> SD card (identity/prefs stay on SPIFFS)");
+  } else {
+    Serial.println("[BOOT] no TF card — contacts/channels stay on internal flash (panel will flash on writes)");
   }
 #endif
   // Repair an unusable SPIFFS whether or not the profile lives on SD.
