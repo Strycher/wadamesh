@@ -163,6 +163,44 @@
   #define CAP_OTA          1
   #define CAP_LOCK_SCREEN  0
 
+#elif defined(HAS_CROWPANEL7)           // ===== Elecrow CrowPanel Advance 7 (ESP32-P4) =====
+  // Was silently falling through to the Heltec V4 defaults below — a 240x320 S3
+  // board — which is why it advertised a rotation setting it cannot honour and
+  // polled a GPS it does not have (#16).
+  #define CAP_TOUCH        1   // GT911 capacitive touch (verified on device)
+  #define CAP_ROTATABLE    0   // fixed-landscape 1024x600 MIPI-DSI: no MADCTL rotate, and
+                               // software-rotating every flush at this size is not worth it.
+                               // Setting is hidden rather than offered-but-ignored.
+  #define CAP_LARGE_SCREEN 1   // 1024x600 — the largest panel in the fleet (Tanmatsu sets 1 at
+                               // merely 800x480). Buys the "UI size" font swap
+                               // (initTouchFontFallbacks: montserrat 12/14/16 -> 16/20/24 ->
+                               // 20/24/28, all compiled in per lv_conf.h) + 1.7x popup cards
+                               // (PSC) + the pinned 16 px tab font.
+                               // Safe despite the Tanmatsu-looking TAN_PANEL_* constants living
+                               // in the same #if block: disp_drv resolution is BOARD-gated
+                               // (HAS_TANMATSU / HAS_CROWPANEL7 / #else), not gated on this flag,
+                               // and the flush upscaler is dead code — s_lv_pw is only ever
+                               // initialised to TAN_PANEL_PW and never reassigned, s_scale_buf is
+                               // never allocated, so `s_lv_pw != TAN_PANEL_PW && s_scale_buf` can
+                               // never be true. UITask.cpp:35963 says so outright: "UI scaling is
+                               // FONT-based at NATIVE resolution now (crisp) ... the flush
+                               // upscaler is left dead".
+  // CAP_SD gates the *Arduino SD* (shared-SPI) path used by the T-Deck/M9/R8, which this
+  // board does not use — exactly as the HAS_TDISPLAY_P4 branch above explains. The card
+  // itself IS mounted and in use: SD_MMC, brought up by offband::sdLogBegin() and set as
+  // the DataStore secondary FS for contacts/channels (#25, #27). Keeping this 0 compiles
+  // out the Arduino-`SD` UI blocks (battery-log-on-SD, WAV sounds, fm SD mount).
+  #define CAP_SD           0
+  // 0 keeps the file-manager UI out; identity and prefs still live on SPIFFS, so the boot
+  // line stays "[BOOT] storage: SPIFFS" even with the card mounted. Browsing SD_MMC can be
+  // wired through the filesystem path later, like the T-Display P4.
+  #define CAP_FILESYSTEM   0
+  #define CAP_GPS          0   // no GPS on this HMI (env: "no GPS / env sensors"). Inheriting
+                               // CAP_GPS=1 made the UI poll a nonexistent GPS — the recurring
+                               // "[STALL] ui:gps ~498ms" in every boot capture.
+  #define CAP_OTA          1   // dual app slots (partitions_crowpanel7.csv: app0/app1 0x3e0000 each)
+  #define CAP_LOCK_SCREEN  0   // unchanged from the inherited default (no behaviour change here)
+
 #else                                    // ===== Heltec V4 TFT (default) =====
   #define CAP_TOUCH        1   // capacitive touch panel
   #define CAP_ROTATABLE    1   // user can flip portrait/landscape
