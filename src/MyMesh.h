@@ -1024,6 +1024,17 @@ public:
    *  Writes channel `idx` with `name` (up to 31 chars) and a 16-byte secret,
    *  persists it to NVS and pokes the UI to refresh its thread list.
    *  Returns false if `idx` is out of range or setChannel rejects the slot. */
+  // #50 part A: push [0x91] to a connected client so it re-polls channels (defined in MyMesh.cpp).
+  void notifyChannelsChanged();
+
+  // #50 part B: queue a device-composed channel message into the companion sync stream,
+  // flagged outgoing, so it shows in a connected client (defined in MyMesh.cpp).
+  void queueOutgoingChannelMessage(uint8_t channel_idx, uint32_t timestamp, const char *text);
+
+  // #50 part B: same for a device-composed DM — recipient_pub is the RECIPIENT's pubkey
+  // prefix so the client files it under the right DM thread (defined in MyMesh.cpp).
+  void queueOutgoingContactMessage(const uint8_t *recipient_pub, uint32_t timestamp, const char *text);
+
   bool uiAddOrUpdateChannel(int idx, const char* name, const uint8_t secret16[16]) {
     if (idx < 0) return false;
     ChannelDetails channel{};
@@ -1033,6 +1044,7 @@ public:
     if (!setChannel(idx, channel)) return false;
     saveChannels();
     if (_ui) _ui->onThreadsChanged();
+    notifyChannelsChanged();   // #50 part A: client re-polls after on-device add/update
     return true;
   }
 
@@ -1205,6 +1217,7 @@ public:
     if (!setChannel(idx, empty)) return false;
     saveChannels();
     if (_ui) _ui->onThreadsChanged();
+    notifyChannelsChanged();   // #50 part A: client re-polls after on-device delete
     return true;
 #else
     (void)idx;

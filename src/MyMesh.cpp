@@ -1,5 +1,8 @@
 #include "MyMesh.h"
 #include <esp_heap_caps.h>
+#if defined(HAS_CROWPANEL7)
+#include "helpers/offband/SdLog.h"   // `log` CLI command (#19)
+#endif
 
 #include <Arduino.h> // needed for PlatformIO
 #include <Mesh.h>
@@ -12,8 +15,12 @@
 #endif
 #ifdef ESP32
 #include <esp_system.h>          // esp_restart for the "bootloader" CLI command
-#if !defined(HAS_TANMATSU) && !defined(HAS_TDISPLAY_P4)
-#include <soc/rtc_cntl_reg.h>    // RTC_CNTL_OPTION1_REG / FORCE_DOWNLOAD_BOOT (S3-only; both P4 boards lack it)
+// RTC_CNTL_OPTION1_REG / FORCE_DOWNLOAD_BOOT is S3-only; no P4 has it. Excluded both
+// by chip (the general rule, which also covers P4 boards added later) and by board name
+// (belt and braces — a hybrid arduino+espidf env need not define the chip macro in every
+// translation unit, and getting this wrong is a compile error on a board we cannot flash).
+#if !defined(CONFIG_IDF_TARGET_ESP32P4) && !defined(HAS_TANMATSU) && !defined(HAS_TDISPLAY_P4) && !defined(HAS_CROWPANEL7)
+#include <soc/rtc_cntl_reg.h>
 #endif
 #endif
 #include <helpers/AdvertDataHelpers.h>
@@ -211,6 +218,9 @@ static void persistProtocolClockBeforeReset(mesh::RTCClock* clock) {
 #define PUSH_CODE_CONTROL_DATA          0x8E   // v8+
 #define PUSH_CODE_CONTACT_DELETED       0x8F // used to notify client app of deleted contact when overwriting oldest
 #define PUSH_CODE_CONTACTS_FULL         0x90 // used to notify client app that contacts storage is full
+#define PUSH_CODE_CHANNELS_CHANGED      0x91 // #50 part A: tell the connected client its channel view is stale
+                                             // (device-side add/update/delete) so it re-polls GET_CHANNEL
+                                             // instead of only refreshing on reconnect. 1-byte frame [0x91].
 
 #define ERR_CODE_UNSUPPORTED_CMD        1
 #define ERR_CODE_NOT_FOUND              2
@@ -667,6 +677,21 @@ bool MyMesh::handleMeshcomodCommand(const char* text, int text_len) {
     return strncasecmp(s, name, n) == 0 && (s[n] == '\0' || s[n] == ' ' || s[n] == '\t');
   };
 
+#if defined(HAS_CROWPANEL7)
+  // `log` / `log all` — stream the TF-card log over serial so it can be pulled
+  // WITHOUT removing the card: `scripts/pio-flash send crowpanel7-dev log --read-time 20`.
+  // A log you can only read by pulling the card isn't observability (#19).
+  // Default dumps the last 16 KB (post-mortems are at the tail; a full dump at
+  // 115200 is ~11.5 KB/s). `log all` dumps everything.
+  if (isCmd(p, "log")) {
+    const char* arg = p + 3;
+    while (*arg == ' ') arg++;
+    const bool all = (strncmp(arg, "all", 3) == 0);
+    offband::sdLogDumpSerial(all ? 0 : 16384);
+    pushMeshcomodReply(offband::sdLogAvailable() ? "log dumped to serial" : "no TF log (card not mounted)");
+    return true;
+  }
+#endif
   if (isCmd(p, "ver") || isCmd(p, "version")) {
     char r[96];
     snprintf(r, sizeof r, "Meshcomod %s\nbuild %s  (code %d)",
@@ -736,12 +761,13 @@ bool MyMesh::handleMeshcomodCommand(const char* text, int text_len) {
     // rest of RTC_CNTL_OPTION1 and wedges the RTC so esp_restart() hangs instead
     // of resetting (that was the earlier "freeze"). board.reboot() == esp_restart,
     // the proven reset path on this board; the RTC bit survives it.
-#if !defined(HAS_TANMATSU) && !defined(HAS_TDISPLAY_P4)
+#if !defined(CONFIG_IDF_TARGET_ESP32P4) && !defined(HAS_TANMATSU) && !defined(HAS_TDISPLAY_P4) && !defined(HAS_CROWPANEL7)
     uint32_t opt1 = REG_READ(RTC_CNTL_OPTION1_REG);
     REG_WRITE(RTC_CNTL_OPTION1_REG, opt1 | RTC_CNTL_FORCE_DOWNLOAD_BOOT);
 #endif
     persistProtocolClockBeforeReset(getRTCClock());
-    board.reboot();   // Tanmatsu/P4: plain reboot (the launcher manages flashing)
+    board.reboot();   // P4 boards (Tanmatsu/T-Display/CrowPanel7): plain reboot — no
+                      // RTC_CNTL_OPTION1 on this chip, and the launcher manages flashing
 #else
     pushMeshcomodReply("bootloader: ESP32-only");
 #endif
@@ -3028,6 +3054,50 @@ ContactInfo*  MyMesh::processAck(const uint8_t *data) {
   return checkConnectionsAck(data);
 }
 
+// #50 part A: notify the connected companion client that the channel table changed
+// on the device side, so it re-polls GET_CHANNEL immediately instead of only on
+// reconnect. Called from every channel mutation (companion CMD_SET_CHANNEL and the
+// on-device uiAddOrUpdateChannel / uiDeleteChannel paths). A no-op when no client is
+// connected. Pairs with meshcore-client#429 (client adds the 0x91 case → getChannels).
+void MyMesh::notifyChannelsChanged() {
+  if (_serial && _serial->isConnected()) {
+    uint8_t frame[1] = { PUSH_CODE_CHANNELS_CHANGED };
+    _serial->writeFrameToAll(frame, 1);
+  }
+}
+
+// #50 part B: queue a DM COMPOSED ON THIS DEVICE into the companion sync stream so it
+// shows in a connected client, marked outgoing. Mirrors the RESP_CODE_CONTACT_MSG_RECV_V3
+// frame built by queueMessage, EXCEPT: the 6-byte pubkey prefix is the RECIPIENT's (so
+// the client files it under the correct DM thread), reserved1 bit0 = 1 is the outgoing
+// flag (meshcore-client#429), and SNR=0 / path_len=0xFF since there is no received packet.
+void MyMesh::queueOutgoingContactMessage(const uint8_t *recipient_pub, uint32_t timestamp, const char *text) {
+  int i = 0;
+  out_frame[i++] = RESP_CODE_CONTACT_MSG_RECV_V3;
+  out_frame[i++] = 0;        // SNR: n/a for a self-composed message
+  out_frame[i++] = 0x01;     // reserved1 bit0 = OUTGOING flag (#50 part B)
+  out_frame[i++] = 0;        // reserved2
+  memcpy(&out_frame[i], recipient_pub, 6);   // 6-byte prefix = the RECIPIENT (client files it under that DM)
+  i += 6;
+  out_frame[i++] = 0xFF;     // path_len: not a received flood
+  out_frame[i++] = TXT_TYPE_PLAIN;
+  memcpy(&out_frame[i], &timestamp, 4);
+  i += 4;
+  int tlen = strlen(text);
+  if (i + tlen > MAX_FRAME_SIZE) tlen = MAX_FRAME_SIZE - i;
+  memcpy(&out_frame[i], text, tlen);
+  i += tlen;
+  uint32_t hist_seq = addToHistoryRing(out_frame, i);
+  if (_serial && _serial->isConnected()) {
+    if (_serial->writeFrameToAll(out_frame, i) == (size_t)i && hist_seq != 0 &&
+        _serial->companionUnsolicitedPushesBroadcastToAll()) {
+      advanceHistoryClientsAfterV3Broadcast(hist_seq);
+    }
+    uint8_t frame[1] = { PUSH_CODE_MSG_WAITING };
+    _serial->writeFrameToAll(frame, 1);
+  }
+}
+
 void MyMesh::queueMessage(const ContactInfo &from, uint8_t txt_type, mesh::Packet *pkt,
                           uint32_t sender_timestamp, const uint8_t *extra, int extra_len, const char *text) {
   // Clock bootstrap from a peer's send-time when we have no real clock of our own (Wi-Fi
@@ -3248,6 +3318,38 @@ int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel dest[],
     if (cd.channel.hash[0] == hash[0]) dest[n++] = cd.channel;
   }
   return n;
+}
+
+// #50 part B: queue a channel message COMPOSED ON THIS DEVICE into the companion sync
+// stream so it appears in a connected client, marked as OUTGOING. A self-composed
+// message has no received packet, so SNR=0 and path_len=0xFF. reserved1 bit0 = 1 is the
+// outgoing flag the client reads (meshcore-client#429) — otherwise the frame is
+// byte-identical to the RESP_CODE_CHANNEL_MSG_RECV_V3 built in onChannelMessageRecv, so
+// the client's existing V3 channel parse handles it unchanged apart from the flag.
+void MyMesh::queueOutgoingChannelMessage(uint8_t channel_idx, uint32_t timestamp, const char *text) {
+  int i = 0;
+  out_frame[i++] = RESP_CODE_CHANNEL_MSG_RECV_V3;
+  out_frame[i++] = 0;        // SNR: n/a for a self-composed message
+  out_frame[i++] = 0x01;     // reserved1 bit0 = OUTGOING flag (#50 part B)
+  out_frame[i++] = 0;        // reserved2
+  out_frame[i++] = channel_idx;
+  out_frame[i++] = 0xFF;     // path_len: not a received flood
+  out_frame[i++] = TXT_TYPE_PLAIN;
+  memcpy(&out_frame[i], &timestamp, 4);
+  i += 4;
+  int tlen = strlen(text);
+  if (i + tlen > MAX_FRAME_SIZE) tlen = MAX_FRAME_SIZE - i;
+  memcpy(&out_frame[i], text, tlen);
+  i += tlen;
+  uint32_t hist_seq = addToHistoryRing(out_frame, i);
+  if (_serial && _serial->isConnected()) {
+    if (_serial->writeFrameToAll(out_frame, i) == (size_t)i && hist_seq != 0 &&
+        _serial->companionUnsolicitedPushesBroadcastToAll()) {
+      advanceHistoryClientsAfterV3Broadcast(hist_seq);
+    }
+    uint8_t frame[1] = { PUSH_CODE_MSG_WAITING };
+    _serial->writeFrameToAll(frame, 1);
+  }
 }
 
 void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint32_t timestamp,
@@ -5000,16 +5102,39 @@ void MyMesh::handleCmdFrame(size_t len) {
     StrHelper::strncpy(channel.name, (char *)&cmd_frame[2], 32);
     memset(channel.channel.secret, 0, sizeof(channel.channel.secret));
     memcpy(channel.channel.secret, &cmd_frame[2 + 32], 16); // NOTE: only 128-bit supported
-    if (setChannel(channel_idx, channel)) {
+    // #50: collision-safe, NAME-KEYED placement. The client supplies channel_idx,
+    // but a reused index would OVERWRITE a DIFFERENT existing channel and orphan its
+    // UI thread ("Channel not found" on a channel still shown in the list). Channels
+    // are resolved by NAME everywhere in the UI (syncThreadMeshSlots), so key on name
+    // here too: an existing same-name slot is updated in place (idempotent add/rekey),
+    // a genuinely new name takes the first FREE slot, and the client's index is
+    // honored only as a fallback (empty name, or no channel cap on this board). The
+    // client re-learns the actual index on its next GET_CHANNEL poll.
+    int target = channel_idx;
+#ifdef MAX_GROUP_CHANNELS
+    if (channel.name[0] != '\0') {
+      ChannelDetails existing;
+      int first_free = -1;
+      target = -1;
+      for (int i = 0; i < MAX_GROUP_CHANNELS; ++i) {
+        const bool in_use = getChannel(i, existing) && existing.name[0] != '\0';
+        if (in_use && strncmp(existing.name, channel.name, 32) == 0) { target = i; break; }
+        if (!in_use && first_free < 0) first_free = i;
+      }
+      if (target < 0) target = first_free;   // new channel -> first free slot (-1 if the table is full)
+    }
+#endif
+    if (target >= 0 && setChannel((uint8_t)target, channel)) {
       saveChannels();
 #ifdef DISPLAY_CLASS
       /* Tell the touch UI to refresh its thread list immediately so the new
        * channel shows up without waiting for the periodic refresh. */
       if (_ui) _ui->onThreadsChanged();
 #endif
+      notifyChannelsChanged();   // #50 part A: other connected clients re-poll
       writeOKFrame();
     } else {
-      writeErrFrame(ERR_CODE_NOT_FOUND); // bad channel_idx
+      writeErrFrame(ERR_CODE_NOT_FOUND); // no free channel slot / bad channel_idx
     }
   } else if (cmd_frame[0] == CMD_SIGN_START) {
     out_frame[0] = RESP_CODE_SIGN_START;
