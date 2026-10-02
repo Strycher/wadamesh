@@ -56,10 +56,15 @@
 #define LV_FONT_MONTSERRAT_12 1
 #define LV_FONT_MONTSERRAT_14 1
 #define LV_FONT_MONTSERRAT_16 1
-/* Larger Montserrat sizes for crisp UI/text-size presets at native resolution. The P4 boards scale
- * text and geometry; V4-R8 uses the same fonts without geometry scaling. Other flash-tighter S3
- * builds don't pay for fonts they never use. (Match board macros because device_caps.h isn't here.) */
-#if defined(HAS_TANMATSU) || defined(HAS_TDISPLAY_P4) || defined(HELTEC_LORA_V4_R8)
+/* Larger Montserrat sizes for crisp UI/text-size presets at native resolution — render the UI
+ * bigger instead of upscaling a low-res frame. The P4 boards scale text and geometry; V4-R8 uses
+ * the same fonts without geometry scaling. Gated to the big-panel boards so the flash-tighter S3
+ * touch builds don't pay for fonts they never use. (Match board macros because device_caps.h
+ * isn't here.)
+ * CrowPanel7 (1024x600) is the largest panel in the fleet, and initTouchFontFallbacks() swaps to
+ * 16/20/24 (Large) and 20/24/28 (Huge) — without these it fails to compile under
+ * CAP_LARGE_SCREEN. Flash cost is a non-issue there: 16 MB flash, app ~65% of a 3.875 MB slot. */
+#if defined(HAS_TANMATSU) || defined(HAS_TDISPLAY_P4) || defined(HELTEC_LORA_V4_R8) || defined(HAS_CROWPANEL7)
 #define LV_FONT_MONTSERRAT_18 1
 #define LV_FONT_MONTSERRAT_20 1
 #define LV_FONT_MONTSERRAT_24 1

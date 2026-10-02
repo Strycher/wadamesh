@@ -28,13 +28,15 @@ platformio.local.ini
 # Local tile-pack build data + generated Wi-Fi creds (never commit)
 /data/
 scripts/build/wifi_secrets.h
-# Generated per build by scripts/inject_version.py: the version strings plus
-# every pin/feature define it relocates off the compile command line. Its
-# contents are env-specific, so a tracked copy would be wrong for whichever
-# env was not built last. NOTE: do NOT widen this to `scripts/build/` — unlike
-# Offband (where inject_version.py came from, and whose comment still claims
-# the whole directory is ignored), scripts/build/ here holds real tracked
-# sources (gen-*.py, patch_*.py, i18n-*.py).
+# Generated per build by scripts/inject_version.py: the version stamp plus every
+# pin/feature define it relocates off the Win32 command line. Board-specific and
+# rewritten on every build, so there is nothing to preserve — and tracking it kept
+# the tree permanently dirty, forced a false "+d" onto FIRMWARE_VERSION via the
+# `git status --porcelain` check, and left one board's pin map committed on another
+# board's branch. (#28)
+# Do NOT widen this to `scripts/build/` — unlike Offband (where inject_version.py
+# came from, and whose comment still claimed the whole directory was ignored),
+# scripts/build/ here holds real tracked sources (gen-*.py, patch_*.py, i18n-*.py).
 scripts/build/offband_patch_version.h
 
 # Local working notes + agent config (contain ops/infra details — never publish)
@@ -54,3 +56,18 @@ CLAUDE.md
 # device's AppFS partition and is both large and device-specific.
 tanmatsu/tools/appfs-src/
 tanmatsu/tools/dev_appfs.bin
+
+# Vendor reference material (Elecrow schematics, C6 OTA bundle, STP/3D — ~36 MB).
+# Not ours: kept on disk for reference and refreshed from the vendor as needed,
+# never committed to the fork. Owner ruling 2026-07-18. (#28)
+# Scoped to docs/hardware/, NOT all of /docs/ as the crowpanel7 branch had it —
+# that branch predates docs/initiatives/, which holds the plans of record and
+# must stay tracked. Ignoring /docs/ wholesale would silently swallow them.
+/docs/hardware/
+
+# --- ESP-IDF hybrid build artifacts (crowpanel7 env, #11) — all derived ---
+/CMakeLists.txt
+/src/CMakeLists.txt
+/dependencies.lock
+/managed_components/
+/sdkconfig.crowpanel7_companion_radio_touch

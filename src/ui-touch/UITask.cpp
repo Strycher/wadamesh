@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <cerrno>   // chat-store write diagnostics surface errno (ENFILE vs ENOSPC vs EIO)
+#include <atomic>   // #31: cross-core handoff to the core-0 storage worker
 #if CAP_LUA_AUDIO
 static void* wadaMp3Scratch();
 #define MINIMP3_ONLY_MP3
@@ -121,6 +122,8 @@ static void* wadaMp3Scratch() { return s_wada_mp3_scratch; }
   #include <FFat.h>            // internal FAT partition (Tanmatsu 'locfd' / P4 'storage')
   #include <SD_MMC.h>          // microSD on the P4-class boards' SDMMC slot 0; slot 1 = C6 radio
   extern bool g_fs_ok;         // set in main.cpp once the internal FAT is mounted
+#elif defined(HAS_CROWPANEL7)
+  #include <SD_MMC.h>          // #25: chat history persists to the microSD (mounted by offband::sdLogBegin)
 #endif
 #include <Utils.h>
 #include <LvglPsramAlloc.h>   // PSRAM-preferred alloc helpers for the map tile cache
@@ -198,6 +201,8 @@ static_assert(ChannelSenderSplit::kMaxWireName >= (size_t)UITask::MAX_SENDER_NAM
     #else
       #include <RM69A10Display.h>            // RM69A10 MIPI-DSI AMOLED (default SKU) on the T-Display P4
     #endif
+  #elif defined(HAS_CROWPANEL7)
+    #include <CrowPanel7Display.h>           // EK79007 MIPI-DSI DisplayDriver (P4)
   #else
     #include <helpers/ui/ST7789LCDDisplay.h>
   #endif
@@ -208,6 +213,7 @@ static_assert(ChannelSenderSplit::kMaxWireName >= (size_t)UITask::MAX_SENDER_NAM
     #include <Preferences.h>
     #include <helpers/esp32/SdNvsPrefs.h>   // NVS-or-SD prefs backend (Launcher-safe)
     #include "helpers/esp32/WdtHeavyGuard.h" // shared ref-counted core-0 WDT suspend (history/backup saves + core saveContacts)
+    #include "helpers/offband/SdLog.h"       // #25: sdLogAvailable() gates CrowPanel7 chat-history routing to SD_MMC
     // QUOTED on purpose: the vendored core lib ships a STALE copy of this header in
     // its include path, so an angle include picks that up and misses accessors we
     // add here (e.g. the signal-probe prefs). Quotes force the local src/ copy.
@@ -260,6 +266,8 @@ static_assert(ChannelSenderSplit::kMaxWireName >= (size_t)UITask::MAX_SENDER_NAM
     extern LGFXDisplay display;
   #elif defined(HAS_TDISPLAY_P4)
     extern DISPLAY_CLASS display;            // RM69A10Display (AMOLED) or HI8561Display (LCD) — set in CMakeLists
+  #elif defined(HAS_CROWPANEL7)
+    extern CrowPanel7Display display;
   #else
     extern ST7789LCDDisplay display;
   #endif
@@ -6431,6 +6439,59 @@ static bool uiSegReadRec(File& f, uint16_t disk_sz, UITask::UIMessage* out, uint
 static bool uiSegCompactWrite(uint32_t first_seq, const UITask::UIMessage* recs, int n, bool sync_writer);
 static bool uiSegAppendRecords(uint32_t first_seq, bool create, const UITask::UIMessage* recs, int n);
 static void uiSegRemoveFile(uint32_t first_seq);
+
+// #22/#20: exponential backoff on PERSISTENT thread-metadata write failure (no
+// card / full fs). A failing write must not re-fire on a fixed 2 s cadence — on
+// CrowPanel7 every flash write whites the panel (a flash erase disables the shared
+// flash/PSRAM cache, starving the DSI framebuffer). Reset to 0 on the next success.
+// The message-ring paths keep their own escalating re-arm (see flushHistoryIfDue,
+// which backs off to 5 min after five straight failures).
+static uint32_t s_threads_flush_backoff_ms = 0;
+static constexpr uint32_t HIST_FLUSH_BACKOFF_BASE_MS = 2000;
+static constexpr uint32_t HIST_FLUSH_BACKOFF_CAP_MS  = 30000;   // cap the loss window
+static inline uint32_t histFlushBackoffNext(uint32_t cur) {
+  uint32_t next = cur ? cur * 2u : HIST_FLUSH_BACKOFF_BASE_MS;
+  return next > HIST_FLUSH_BACKOFF_CAP_MS ? HIST_FLUSH_BACKOFF_CAP_MS : next;
+}
+// #22: thread-metadata flush, offloaded to the same core-1 flush task as the
+// message ring. Measured on device: saveThreadsToStorage() on the loop thread blocked
+// 1.1-2.7 s per write once history fell back to internal flash, starving the UI
+// hard enough that even the storage warning banner could not draw. The loop now
+// SERIALISES the 48-slot table into this snapshot (pure memcpy, no I/O) and the
+// flush task does the file write — same no-shared-live-state contract as the ring,
+// so the worker never reads _ui_threads[] while the loop mutates it.
+// #31: the handoff is a SINGLE atomic state machine, not three volatile flags.
+//
+// volatile is not a synchronisation primitive: on this dual-core RISC-V (weak
+// memory model) it orders nothing between cores. The previous three-flag version
+// had four defects — the snapshot could be published before its own contents were
+// visible; `busy = true; req = false;` could be observed out of order, letting the
+// loop re-arm over a live write; and the shutdown path watched only `busy`, so an
+// armed-but-unstarted request let two threads write the same file at once.
+//
+// One variable makes all of that unrepresentable. Transitions:
+//
+//     IDLE --(loop: snapshot armed)--> REQ --(worker starts)--> BUSY --(done)--> IDLE
+//
+// Strictly single-producer / single-consumer: ONLY the loop does IDLE->REQ, ONLY
+// the worker does REQ->BUSY and BUSY->IDLE. Each transition therefore has exactly
+// one writer, so plain acquire/release load/store is sufficient and NO
+// compare-exchange is needed — which matters here: -march=rv32imafc has no 'A'
+// extension, so std::atomic lowers to libatomic (ESP-IDF critical sections), not
+// hardware atomics. At roughly one flush per second the cost is irrelevant.
+//
+// The release/acquire pair is load-bearing: the release store of REQ is what
+// guarantees the ~4 KB of snapshot writes are visible to core 0 before the worker
+// sees the request. Downgrading either to relaxed reintroduces defect 1.
+enum : uint8_t { THREADS_FLUSH_IDLE = 0, THREADS_FLUSH_REQ = 1, THREADS_FLUSH_BUSY = 2 };
+static std::atomic<uint8_t> s_threads_flush_state{THREADS_FLUSH_IDLE};
+static std::atomic<bool>    s_threads_flush_ok{true};
+static UiHistoryThread s_threads_snap[UITask::MAX_UI_THREADS];
+static int16_t         s_threads_snap_active_idx  = -1;
+static uint8_t         s_threads_snap_active_isch = 0;
+static uint32_t        s_threads_snap_msgcount    = 0;   // companion counter rides this file
+static bool uiThreadsWorkerFlush();              // defined with the storage code below
+static void serializeThreadsInto(UiHistoryThread* out, const UITask::UIThread* threads);
 static volatile bool s_sdinfo_done     = false;  // worker -> UI: a result exists
 static volatile bool s_sdinfo_ok       = false;  // card present + sizes valid
 static uint64_t      s_sdinfo_tot      = 0;
@@ -11216,10 +11277,23 @@ static void openAdvertPage() {
 
   // Full-screen app page using the GLOBAL tall status bar ("‹ Send advert", tap = Back) — same
   // chrome as RF Monitor / Spectrum, instead of a modal with its own header.
+  //
+  // Go tall BEFORE laying out, and lay out against statusBarCurH() (the ACTUAL bar
+  // height = STATUSBAR_H*2 when tall), not STATUSBAR_H.
+  // Bug this fixes (#16, owner: "the only way out of the Advert screen is to send an
+  // advert; Back doesn't work"): the page pinned itself at y=STATUSBAR_H (22) while the
+  // bar was tall (44) and — being created later on the same lv_layer_top() — sat ON TOP
+  // of bar rows 22..44. That band is exactly where the centred "‹ Send advert" back
+  // affordance lives, so the page swallowed every tap on it and the page could not be
+  // dismissed. Same latent pattern exists in the Spectrum / RF Monitor pages (they set
+  // tall AFTER positioning at STATUSBAR_H too) — left alone here deliberately; they're
+  // shared with the S3 boards and unreported. Tracked in #16.
+  statusBarSetTall(true);
+  const lv_coord_t bar_h = statusBarCurH();
   s_advert_root = lv_obj_create(lv_layer_top());
   lv_obj_remove_style_all(s_advert_root);
-  lv_obj_set_size(s_advert_root, sw, sh - STATUSBAR_H);
-  lv_obj_set_pos(s_advert_root, 0, STATUSBAR_H);
+  lv_obj_set_size(s_advert_root, sw, sh - bar_h);
+  lv_obj_set_pos(s_advert_root, 0, bar_h);
   lv_obj_set_style_bg_color(s_advert_root, lv_color_hex(COLOR_BG), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_advert_root, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_clear_flag(s_advert_root, LV_OBJ_FLAG_SCROLLABLE);
@@ -11227,9 +11301,10 @@ static void openAdvertPage() {
 
   s_apppage_title = "Send advert";
   s_apppage_close = closeAdvertPage;
-  statusBarSetTall(true);
-  updateGlobalStatusBar();
-  const int top = STATUSBAR_H + 8;
+  updateGlobalStatusBar();   // (tall already set above, before layout)
+  // Content offsets are relative to s_advert_root, which now starts BELOW the tall
+  // bar — so the old "STATUSBAR_H + 8" (absolute-ish) becomes a plain top padding.
+  const int top = 8;
 #if CAP_TOUCH
   // Match the floating Home affordance used by Terminal and Files. Aligning to
   // the right edge keeps it reachable on both Heltec portrait and wide screens.
@@ -11259,8 +11334,10 @@ static void openAdvertPage() {
   // (the modal used the same pattern to keep LVGL's scroll-bounds machinery happy).
   lv_obj_t* scroll = lv_obj_create(s_advert_root);
   lv_obj_remove_style_all(scroll);
+  // scroll_top keeps room for the CAP_TOUCH Home affordance; bar_h (not STATUSBAR_H)
+  // because s_advert_root already starts below the ACTUAL, tall bar.
   lv_obj_set_pos(scroll, 4, scroll_top);
-  lv_obj_set_size(scroll, sw - 8, (sh - STATUSBAR_H) - scroll_top - 4);
+  lv_obj_set_size(scroll, sw - 8, (sh - bar_h) - scroll_top - 4);
   lv_obj_set_style_pad_all(scroll, 0, LV_PART_MAIN);
   lv_obj_set_scroll_dir(scroll, LV_DIR_VER);
   lv_obj_set_scrollbar_mode(scroll, LV_SCROLLBAR_MODE_ON);   // always show — remove_style_all stripped the default bar
@@ -15067,9 +15144,11 @@ static void buildDeviceSettings(int sec) {
     y += SC(44);
   }
   /* Message LED: flash the envelope-icon LED on a new message and softly breathe it while there
-     are unread messages. Turn off to keep that LED dark. (Tanmatsu only — the others have no such
-     LED. It lives under CAP_LARGE_SCREEN, so it must be gated to HAS_TANMATSU explicitly now that
-     the T-Display P4 is also a large-screen board.) */
+     are unread messages. Turn off to keep that LED dark. (Tanmatsu only — the others have no such LED.)
+     Gated on HAS_TANMATSU, NOT CAP_LARGE_SCREEN: this is a Tanmatsu HARDWARE feature that was
+     riding the large-screen flag only because Tanmatsu was the sole large-screen board. The
+     T-Display P4 and CrowPanel7 (1024x600, no such LED) are also large-screen boards, and
+     CrowPanel7 does not define touchPrefsGetMsgLed/msgLedToggleCb at all. */
 #if defined(HAS_TANMATSU)
   {
     int h = settingsRowLabel(body, y, 6, TR("Message LED"), COLOR_SUB, nullptr, 56);
@@ -21367,6 +21446,22 @@ static lv_obj_t* s_home_chart_legend = nullptr;
 static lv_obj_t* s_home_chart_sig    = nullptr;   // live signal chip drawn inside the graph box
 #if CAP_LARGE_SCREEN
 static lv_obj_t* s_home_info         = nullptr;   // Commander info-panel values column (big screen) — refreshed live
+#if defined(HAS_CROWPANEL7)
+// Persistent storage-state banner on Home (#20/#26). SAFELANE §6: storage
+// degradation must be VISIBLE, not silent — and it must persist while the
+// condition holds, not flash past as a toast. Two states:
+//   no card at boot  -> history falls back to internal flash: still saved, but
+//                       the panel flashes on every write and the ring is 500
+//                       instead of 5000.
+//   card lost (write failed after a good mount) -> writes are FAILING; new
+//                       messages are NOT being persisted. This is the dangerous
+//                       one and stays until TF hot-plug recovery lands (#26).
+// #29: the dedicated banner object is gone — this state is now the Home info
+// card's "Storage" row (see refreshStatusLabels). The flag below still drives it.
+static std::atomic<bool> s_sd_write_failed{false};  // WRITTEN BY THE CORE-1 FLUSH TASK from
+                                                 // the real write result, read by the loop/UI —
+                                                 // it must be atomic (#22 made it async)
+#endif
 #endif
 
 static void heartbeatAnimOpa(void* var, int32_t v) {
@@ -21378,6 +21473,22 @@ static void heartbeatAnimSize(void* var, int32_t v) {
   lv_obj_set_size(static_cast<lv_obj_t*>(var), v, v);
   lv_obj_set_style_radius(static_cast<lv_obj_t*>(var), v / 2, LV_PART_MAIN);
 }
+
+// ---- Battery UI capability -------------------------------------------------
+// Whether this board can observe battery voltage/charge at all. On the CrowPanel
+// Advance 7 (ESP32-P4) both VBAT and charge status terminate at an STC8H1K08 aux
+// MCU over an undocumented UART — the P4 has NO ADC pin or GPIO for either
+// (Elecrow V1.2 schematic §13.1; Strycher/wadamesh#51). With no readable source,
+// getBattMilliVolts() is 0 and the battery widget would show a bogus empty/"?".
+// So hide the battery UI on such boards rather than lie. Default: boards have it.
+// Override for other no-telemetry HMIs with -D BOARD_HAS_BATTERY_UI=0.
+#ifndef BOARD_HAS_BATTERY_UI
+  #if defined(HAS_CROWPANEL7)
+    #define BOARD_HAS_BATTERY_UI 0
+  #else
+    #define BOARD_HAS_BATTERY_UI 1
+  #endif
+#endif
 
 // ---- Battery / charge state ----
 // A single Li-ion cell can't rest above ~4.2 V. When USB is plugged the charger
@@ -25550,15 +25661,20 @@ static void openSignalInfoPopup() {
   lv_label_set_text(dlbl, TR("Auto-discover"));
   lv_obj_set_style_text_color(dlbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
   lv_obj_set_style_text_font(dlbl, &g_font_12, LV_PART_MAIN);
-  lv_obj_set_pos(dlbl, 0, cy + 4);
+  lv_obj_set_pos(dlbl, 0, cy + SC(4));
   lv_obj_t* dsw = lv_switch_create(card);            // theme recolours the "on" track to the accent
-  lv_obj_set_size(dsw, 44, 24);
-  lv_obj_set_pos(dsw, card_w - 20 - 44, cy);
+  lv_obj_set_size(dsw, SC(44), SC(24));
+  lv_obj_set_pos(dsw, card_w - 20 - SC(44), cy);
   if (touchPrefsGetSigProbeEnabled()) lv_obj_add_state(dsw, LV_STATE_CHECKED);
   lv_obj_add_event_cb(dsw, sigProbeToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
-  cy += 32;
+  cy += SC(32);   // scale with the row (see the SC() note on the poll row below)
 
   // ---- Poll interval (minutes; clamped 1..1440 on Set) ----
+  // Positions/sizes go through SC() so the row tracks the UI-size font swap. With raw
+  // pixels (x=70/122/168, tuned for a 12 px font) the wider Large/Huge fonts overran
+  // their slots: "Poll every" was clipped mid-word by the textarea and the taller row
+  // spilled into "Probe now" (#16, owner-reported). SC() is identity on the S3 boards
+  // (s_ui_fscale only moves under CAP_LARGE_SCREEN), so they are unchanged.
   lv_obj_t* plbl = lv_label_create(card);
   lv_label_set_text(plbl, TR("Poll every"));
   lv_obj_set_style_text_color(plbl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
@@ -25571,7 +25687,7 @@ static void openSignalInfoPopup() {
   const int poll_w = 64;
   lv_obj_set_pos(plbl, 0, cy + (poll_h - poll_line_h) / 2);
 #else
-  lv_obj_set_pos(plbl, 0, cy + 7);
+  lv_obj_set_pos(plbl, 0, cy + SC(7));
 #endif
   s_sig_poll_ta = lv_textarea_create(card);
 #if defined(TLORA_PAGER)
@@ -25579,8 +25695,8 @@ static void openSignalInfoPopup() {
   lv_obj_set_pos(s_sig_poll_ta, poll_x, cy);
   lv_obj_set_style_text_font(s_sig_poll_ta, &g_font_12, LV_PART_MAIN);
 #else
-  lv_obj_set_size(s_sig_poll_ta, 46, 30);
-  lv_obj_set_pos(s_sig_poll_ta, 70, cy);
+  lv_obj_set_size(s_sig_poll_ta, SC(46), SC(30));
+  lv_obj_set_pos(s_sig_poll_ta, SC(70), cy);
 #endif
   lv_textarea_set_one_line(s_sig_poll_ta, true);
   lv_textarea_set_max_length(s_sig_poll_ta, 4);
@@ -25596,7 +25712,7 @@ static void openSignalInfoPopup() {
   const int unit_x = poll_x + poll_w + 10;
   lv_obj_set_pos(ulbl, unit_x, cy + (poll_h - poll_line_h) / 2);
 #else
-  lv_obj_set_pos(ulbl, 122, cy + 7);
+  lv_obj_set_pos(ulbl, SC(122), cy + SC(7));
 #endif
   lv_obj_t* setb = lv_btn_create(card);
 #if defined(TLORA_PAGER)
@@ -25605,8 +25721,8 @@ static void openSignalInfoPopup() {
   lv_obj_set_size(setb, 58, poll_h);
   lv_obj_set_pos(setb, set_x, cy);
 #else
-  lv_obj_set_size(setb, 50, 30);
-  lv_obj_set_pos(setb, 168, cy);
+  lv_obj_set_size(setb, SC(50), SC(30));
+  lv_obj_set_pos(setb, SC(168), cy);
 #endif
   styleButton(setb);
   lv_obj_add_event_cb(setb, sigPollSaveCb, LV_EVENT_CLICKED, nullptr);
@@ -25621,12 +25737,12 @@ static void openSignalInfoPopup() {
   // full control gap so that outline cannot cover the Probe button below it.
   cy += poll_h + 16;
 #else
-  cy += 40;
+  cy += SC(40);   // was 40: too short once the row grew -> overlapped "Probe now"
 #endif
 
   // ---- Manual probe button ----
   lv_obj_t* rfb = lv_btn_create(card);
-  lv_obj_set_size(rfb, card_w - 20, 32);
+  lv_obj_set_size(rfb, card_w - 20, SC(32));
   lv_obj_set_pos(rfb, 0, cy);
   styleButton(rfb);
   lv_obj_add_event_cb(rfb, sigProbeNowCb, LV_EVENT_CLICKED, nullptr);
@@ -29003,12 +29119,28 @@ static void makeHome(lv_obj_t* tab) {
 #else
     const int info_card_h = home_avail - info_y - SC(8);
     const int info_fh     = lv_font_get_line_height(info_font);
-    int info_ls = (info_card_h - 16 - 8 * info_fh) / 7;   // pad_all=8 → -16
+    // #29: CrowPanel7 carries a 9th "Storage" row (TF-card state). The row count is
+    // BOARD-GATED, not screen-gated: this card is CAP_LARGE_SCREEN but the storage
+    // state (offband::sdLogAvailable / s_sd_write_failed) is HAS_CROWPANEL7 — a
+    // different board set. Deriving the spacing from a hardcoded 8 here while the
+    // value column emits 9 lines is what clips the last row off the bottom at Huge.
+#if defined(HAS_CROWPANEL7)
+    const int info_rows = 9;
+#else
+    const int info_rows = 8;
+#endif
+    int info_ls = (info_card_h - 16 - info_rows * info_fh) / (info_rows - 1);   // pad_all=8 → -16
     if (info_ls < 1) info_ls = 1;
     if (info_ls > 8) info_ls = 8;
 #endif
     lv_obj_t* keys = lv_label_create(card);
+    // CrowPanel7 carries a 9th row for the TF-card state (#29). Untranslated on
+    // purpose: the 8-row string is an existing translation key, the 9-row one is not.
+#if defined(HAS_CROWPANEL7)
+    lv_label_set_text(keys, "Node\nRegion\nRadio\nSignal\nContacts\nChannels\nBattery\nUptime\nStorage");
+#else
     lv_label_set_text(keys, TR("Node\nRegion\nRadio\nSignal\nContacts\nChannels\nBattery\nUptime"));
+#endif
     lv_obj_set_style_text_color(keys, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
     lv_obj_set_style_text_font(keys, info_font, LV_PART_MAIN);
     lv_obj_set_style_text_line_space(keys, info_ls, LV_PART_MAIN);
@@ -31348,6 +31480,8 @@ static int wifiScanWatchdogSafe(uint32_t cap_ms, uint16_t per_chan_ms = 300) {
   #endif
 #elif defined(HAS_TANMATSU)
 #define WADA_BOARD_ID "tanmatsu"
+#elif defined(HAS_CROWPANEL7)
+#define WADA_BOARD_ID "crowpanel7"
 #elif defined(HELTEC_LORA_V4_R8)          // must precede the V4-TFT fallback
 #define WADA_BOARD_ID "heltec-v4-r8-tft"
 #elif defined(HAS_THINKNODE_M9)
@@ -31706,7 +31840,9 @@ static void tileFetchTaskFn(void* arg) {
     // THIS worker it shared core 0 with the Wi-Fi driver, whose prio-23 tasks
     // starve a prio-1 task for hundreds of ms; sd_diskio's busy-waits measure
     // wall time, so healthy SD writes surfaced as timeouts/EIO here while the
-    // identical write from core 1 succeeded.)
+    // identical write from core 1 succeeded. The #22/#31 thread-metadata flush
+    // was written against THIS worker on the beta_36 base and has been moved to
+    // histFlushTaskFn for the same reason — it is the same kind of SD write.)
     // Firmware update check (one-shot, infrequent). Reuses this worker's stack.
     if (s_verchk_request) {
       s_verchk_request = false;
@@ -32234,6 +32370,31 @@ static void histFlushTaskFn(void*) {
       s_hist_flush_ok   = uiSegRunArmedJob();   // segmented store: one append/compact per job
       s_hist_flush_busy = false;
     }
+    // #22/#31: thread-metadata flush. Keeps the 1.1-2.7 s storage write off the
+    // loop thread so the UI stays responsive. It rides THIS task rather than the
+    // core-0 worker it was written against: it is an SD write, and the block
+    // comment above is why SD writes do not belong on the Wi-Fi core.
+    //
+    // The ACQUIRE load below pairs with the loop's release store of REQ: it is what
+    // makes the snapshot contents visible to this core before we read them. Moving
+    // straight to BUSY (single consumer, so no CAS race) closes the window the old
+    // two-flag version had, where the loop could observe req-cleared before
+    // busy-set and re-arm over this very write.
+    if (s_threads_flush_state.load(std::memory_order_acquire) == THREADS_FLUSH_REQ) {
+      s_threads_flush_state.store(THREADS_FLUSH_BUSY, std::memory_order_release);
+      const bool flush_ok = uiThreadsWorkerFlush();
+      s_threads_flush_ok.store(flush_ok, std::memory_order_relaxed);
+#if defined(HAS_CROWPANEL7)
+      // #20/#26: the Home Storage row tracks the REAL last write result. A failure
+      // after a good mount means the card is gone/unwritable and messages are no
+      // longer being persisted — surface it rather than lose them silently
+      // (SAFELANE §6). Clears as soon as a write succeeds (e.g. card re-seated).
+      if (offband::sdLogAvailable()) s_sd_write_failed.store(!flush_ok, std::memory_order_relaxed);
+#endif
+      // Release: everything above (including the closed file) happens-before any
+      // other thread observes IDLE and is allowed to touch the snapshot again.
+      s_threads_flush_state.store(THREADS_FLUSH_IDLE, std::memory_order_release);
+    }
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
@@ -32243,6 +32404,10 @@ static bool ensureHistFlushTaskRunning() {
     // The segment writers keep their bulk buffers on the heap; stack use is
     // File objects + FatFs path work. 6 KB leaves ample headroom (the tile
     // worker's overflow-into-globals history earned the caution).
+    // Still 6 KB with the #22/#31 threads flush riding along: it is the same
+    // shape of write (its snapshot is a static global, not a stack buffer) and
+    // the two jobs run sequentially in this one task, so the peak is the larger
+    // of the two, not their sum.
     static const size_t k_sz = 6 * 1024;
     s_hist_flush_stack = (StackType_t*)heap_caps_malloc(k_sz, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!s_hist_flush_stack) return false;
@@ -46546,7 +46711,9 @@ static void powerOffCb(lv_event_t* e) {
   gpio_hold_en((gpio_num_t)PIN_TFT_LEDA_CTL);
   gpio_deep_sleep_hold_en();                      // released in HeltecV4Board::begin on wake
 #endif
-#if defined(PIN_USER_BTN)
+#if defined(PIN_USER_BTN) && (PIN_USER_BTN >= 0)
+  // (>= 0: boards with no wake button — CrowPanel7 sets -1 — skip the ext0 setup
+  //  entirely; the P4 also lacks ext0 wakeup, so this block must compile out there.)
   const gpio_num_t wake = (gpio_num_t)PIN_USER_BTN;   // GPIO0, trackball click, active-low
   // CRITICAL: the trackball button is held HIGH by a pull-up while idle and
   // pulled LOW only when pressed. Across deep sleep the normal GPIO pull is
@@ -46567,8 +46734,10 @@ static void powerOffCb(lv_event_t* e) {
 #endif  // directly wakeable PIN_USER_BTN (powerOffCb)
 
 #if defined(ESP32)
-#if !defined(HAS_TANMATSU) && !defined(HAS_TDISPLAY_P4)
-#include "soc/rtc_cntl_reg.h"   // RTC_CNTL_FORCE_DOWNLOAD_BOOT (header-guarded)
+// Same union gate as MyMesh.cpp: by chip (covers P4 boards added later) and by
+// board name (a hybrid arduino+espidf env need not define the chip macro here).
+#if !defined(CONFIG_IDF_TARGET_ESP32P4) && !defined(HAS_TANMATSU) && !defined(HAS_TDISPLAY_P4) && !defined(HAS_CROWPANEL7)
+#include "soc/rtc_cntl_reg.h"   // RTC_CNTL_FORCE_DOWNLOAD_BOOT (S3-only; header-guarded)
 #endif
 // Force the ROM serial bootloader (USB download / flash mode) on the next reset,
 // so the device can be reflashed over USB without holding BOOT + tapping RST. The
@@ -46576,7 +46745,7 @@ static void powerOffCb(lv_event_t* e) {
 // esptool's post-flash reset — or a power cycle — clears it back to a normal boot.
 // (Tanmatsu/P4 has no RTC_CNTL_OPTION1_REG and the launcher manages flashing — plain restart.)
 static void rebootToDownloadMode() {
-#if !defined(HAS_TANMATSU) && !defined(HAS_TDISPLAY_P4)
+#if !defined(CONFIG_IDF_TARGET_ESP32P4) && !defined(HAS_TANMATSU) && !defined(HAS_TDISPLAY_P4) && !defined(HAS_CROWPANEL7)
   REG_SET_BIT(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
 #endif
   ESP.restart();
@@ -50470,6 +50639,7 @@ static void buildGlobalStatusBar() {
 
   // Right zone, anchored to the right edge (from rightmost to leftmost):
   // battery icon, battery %, signal bars, Wi-Fi, Bluetooth, clock. Compact spacings.
+#if BOARD_HAS_BATTERY_UI
   g_statusbar.batt_icon = lv_label_create(g_statusbar.root);
   lv_label_set_text(g_statusbar.batt_icon, LV_SYMBOL_BATTERY_2);
   lv_obj_set_style_text_color(g_statusbar.batt_icon, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
@@ -50504,6 +50674,7 @@ static void buildGlobalStatusBar() {
   // the bar root's NAV_SKIP into its children, so each indicator opts out individually.)
   lv_obj_add_flag(g_statusbar.batt_icon, NAV_SKIP_FLAG);
   lv_obj_add_flag(g_statusbar.batt_pct,  NAV_SKIP_FLAG);
+#endif  // BOARD_HAS_BATTERY_UI — crowpanel7 has no readable battery, hide the cluster
 
   g_statusbar.clock = lv_label_create(g_statusbar.root);
   lv_label_set_text(g_statusbar.clock, "--:--");
@@ -51221,7 +51392,7 @@ static void updateGlobalStatusBar() {
     if (charging)       buf[0] = '\0';                       // charging -> batteryGlyphForMv shows the bolt; no text
     else if (pct < 0)   snprintf(buf, sizeof(buf), "?");
     else                snprintf(buf, sizeof(buf), "%d%%", pct);
-    lv_label_set_text(g_statusbar.batt_pct, buf);
+    if (g_statusbar.batt_pct) lv_label_set_text(g_statusbar.batt_pct, buf);   // null when board hides battery UI
     if (charging != s_last_charging) {
       // The % column disappears while charging (bolt only), so slide everything
       // left of the battery rightward to keep it snug against the bolt — else a
@@ -51274,7 +51445,7 @@ static void updateGlobalStatusBar() {
   static const char* s_last_glyph = nullptr;
   const char* g = batteryGlyphForMv(mv);
   if (g != s_last_glyph) {
-    lv_label_set_text(g_statusbar.batt_icon, g);
+    if (g_statusbar.batt_icon) lv_label_set_text(g_statusbar.batt_icon, g);   // null when board hides battery UI
     s_last_glyph = g;
   }
 #if defined(HAS_TDECK_GT911) || defined(HAS_THINKNODE_M9)
@@ -51514,6 +51685,12 @@ static void relayoutHomeCharts() {
     lv_obj_set_pos(s_home_chart, 0, legend_y + 16);
   }
 
+  // #29: the floating storage banner that used to live here is gone. It was created
+  // before the info card and so lost the z-order to it — drawn, but with its text
+  // unreadable underneath the card. The state is now a "Storage" row INSIDE that
+  // card (see refreshStatusLabels), where it cannot be occluded. Still surfaced
+  // persistently while degraded (SAFELANE §6) — only the presentation changed.
+
   if (s_home_adv_btn && !home_land) {
     const int button_y = legend_y + 16 + chart_h + 8;
     const int button_gap = 8;
@@ -51746,9 +51923,26 @@ static void refreshStatusLabels() {
     const int      snr = the_mesh.uiSignalSnrQ4() / 4;
     const uint16_t mv  = g_lv.task->getBattMilliVolts();
     const uint32_t up  = millis() / 1000;
-    char val[224];
+#if defined(HAS_CROWPANEL7)
+    // #29: 9th row — TF-card state, replacing the floating banner that the info
+    // card covered (it was created before the card, so it lost the z-order and its
+    // text was unreadable). A row INSIDE the card cannot collide with the card.
+    // LV_SYMBOL_WARNING, not U+26A0: the built-in LVGL symbol set is present in
+    // these Montserrat fonts (used throughout this file), but Montserrat has no
+    // U+26A0 glyph and would render tofu.
+    const char* storage_state =
+        s_sd_write_failed.load(std::memory_order_relaxed)
+                                       ? LV_SYMBOL_WARNING " TF lost - NOT saving"
+      : !offband::sdLogAvailable()     ? LV_SYMBOL_WARNING " Internal (may flash)"
+                                       : "TF card";
+#endif
+    char val[288];
     snprintf(val, sizeof val,
-        "%s\n%.3f MHz\nSF%u \xC2\xB7 BW%.0f \xC2\xB7 %ddBm\n%d dB\n%d\n%d\n%.2f V\n%uh %02um",
+        "%s\n%.3f MHz\nSF%u \xC2\xB7 BW%.0f \xC2\xB7 %ddBm\n%d dB\n%d\n%d\n%.2f V\n%uh %02um"
+#if defined(HAS_CROWPANEL7)
+        "\n%s"
+#endif
+        ,
         nm,
         pr ? (double)pr->freq : 0.0,
         pr ? (unsigned)pr->sf : 0u,
@@ -51757,7 +51951,11 @@ static void refreshStatusLabels() {
         snr,
         the_mesh.getNumContacts(), the_mesh.getNumChannels(),
         mv / 1000.0,
-        (unsigned)(up / 3600), (unsigned)((up % 3600) / 60));
+        (unsigned)(up / 3600), (unsigned)((up % 3600) / 60)
+#if defined(HAS_CROWPANEL7)
+        , storage_state
+#endif
+        );
     setLabelIfChanged(s_home_info, val);
   }
 #endif
@@ -55479,15 +55677,44 @@ void UITask::flushHistoryIfDue(unsigned long now) {
       showAlert(msg, 3200);
     }
   }
+  // #22: the thread write is ASYNC now, so its result arrives here rather than as
+  // a return value. A failed worker write backs off (never a fixed re-fire — that
+  // would strobe the panel, #20) and re-arms. The Home Storage row is maintained by
+  // the worker itself so it always reflects the real last write result.
+  // #31: exchange() rather than load-then-store — the worker can set this false at
+  // any moment, and a separate read/write pair could clobber a fresh failure signal
+  // between them, silently losing the retry.
+  if (!s_threads_flush_ok.exchange(true, std::memory_order_relaxed)) {
+    s_threads_flush_backoff_ms = histFlushBackoffNext(s_threads_flush_backoff_ms);
+    _threads_dirty = true;                                    // retry this write
+    _next_threads_flush_ms = now + s_threads_flush_backoff_ms;
+  }
   // Thread metadata (~4 KB) flushes on a short delay; the message ring
   // (scales with MAX_UI_MESSAGES) flushes lazily to reduce flash write pressure.
   if (_threads_dirty && now >= _next_threads_flush_ms) {
-    if (s_hist_flush_busy) {
-      // The worker is mid-write on the same filesystem; SPIFFS serializes
-      // internally, so writing now would block the loop behind its GC. Defer.
+    // #31: one state covers both "armed" and "in flight" — the old two-flag gate
+    // could see req-cleared before busy-set and re-arm over a live write.
+    if (s_hist_flush_busy ||
+        s_threads_flush_state.load(std::memory_order_acquire) != THREADS_FLUSH_IDLE) {
+      // A worker write is in flight (or one is already armed) — arming now would
+      // rewrite the snapshot underneath it. Defer; no write happens here, so no
+      // panel blink, and a short fixed defer is fine.
       _next_threads_flush_ms = now + 1000;
-    } else if (saveThreadsToStorage()) _threads_dirty = false;
-    else _next_threads_flush_ms = now + 2000;
+    } else {
+      // #22: hand the write to the core-1 flush task. Serialising the 48-slot table is
+      // a pure memcpy on the loop thread (microseconds); the 1.1-2.7 s file write
+      // now happens off-loop, so the UI no longer freezes on every flush — which is
+      // also what stopped the storage banner drawing when it was needed most.
+      serializeThreadsInto(s_threads_snap, _ui_threads);
+      s_threads_snap_active_idx  = static_cast<int16_t>(_active_thread_idx);
+      s_threads_snap_active_isch = _active_thread_is_channel ? 1u : 0u;
+      s_threads_snap_msgcount    = static_cast<uint32_t>(_msgcount);
+      // #31: RELEASE — this publishes every snapshot store above. The worker's
+      // acquire load pairs with it. Must be the LAST write of the arming sequence.
+      s_threads_flush_state.store(THREADS_FLUSH_REQ, std::memory_order_release);
+      _threads_dirty = false;
+      s_threads_flush_backoff_ms = 0;   // armed cleanly; re-set by the failure path
+    }
   }
   if (_msgs_dirty && now >= _next_msgs_flush_ms) {
     if (s_hist_flush_busy || s_hist_flush_req) {
@@ -55681,6 +55908,28 @@ static bool uiDataFsReady() {
     return true;
   }
   if (SPIFFS.begin(false)) { s_ui_data_fs = &SPIFFS; s_ui_data_root[0] = '\0'; return true; }
+#elif defined(HAS_CROWPANEL7)
+  // CrowPanel7 (#25): persist chat history to the microSD card, NOT internal flash.
+  // Every internal-flash write briefly whites the DSI panel (a flash erase disables
+  // the shared flash/PSRAM cache, starving the framebuffer — #20); the SD card is a
+  // separate peripheral, so writing it never blinks the screen. The card is mounted
+  // once at boot by offband::sdLogBegin() via SD_MMC; reuse that &SD_MMC here at the
+  // T-Deck-style /meshcomod root. No card -> fall through to SPIFFS (still works,
+  // just flashes on write) so history is never silently lost.
+  if (offband::sdLogAvailable()) {
+    SD_MMC.mkdir("/meshcomod");                 // no-op if it already exists
+    if (SD_MMC.exists("/meshcomod")) {          // review: don't claim SD silently if unwritable
+      s_ui_data_fs = &SD_MMC;
+      strncpy(s_ui_data_root, "/meshcomod", sizeof s_ui_data_root - 1);
+      return true;
+    }
+    // Card mounted but /meshcomod not creatable (read-only / corrupt FS) — fall
+    // through to SPIFFS rather than silently failing every history write.
+  }
+  if (SPIFFS.begin(false) || SPIFFS.begin(true)) {
+    s_ui_data_fs = &SPIFFS; s_ui_data_root[0] = '\0';
+    return true;
+  }
 #elif defined(HAS_THINKNODE_M9)
   // ThinkNode M9: same Arduino-SD-on-shared-bus shape as the T-Deck (CAP_SD=1;
   // used to fall into the V4 SPIFFS #else, losing the SD-backed deep message
@@ -57841,6 +58090,78 @@ bool UITask::loadHistoryFromStorage() {
 #endif
 }
 
+#if defined(ESP32)
+// #22: the actual file write, taking an ALREADY-SERIALISED table. Callable from
+// either thread because it touches no live UI state — the loop-side snapshot
+// (worker path) and the synchronous shutdown path both funnel through here.
+// msgcount is passed in for the same reason: the segmented msgs store does not
+// carry the companion message counter, this file does, and a free function has
+// no _msgcount of its own.
+static bool uiWriteThreadsFile(const UiHistoryThread* threads,
+                               int16_t active_idx, uint8_t active_is_channel,
+                               uint32_t msgcount) {
+  WdtHeavyGuard _wg;
+  // Write to the tmp, commit with rename: a power cut mid-write leaves the old
+  // index intact instead of a short file the next boot would quarantine.
+  File f = uiDataOpen(k_ui_threads_tmp_path, "w");
+  if (!f) return false;
+
+  UiHistoryHeader hdr{};
+  hdr.magic                 = k_ui_threads_magic;
+  hdr.version               = k_ui_history_version;
+  hdr.thread_rec_size       = static_cast<uint16_t>(sizeof(UiHistoryThread));
+  hdr.active_thread_idx     = active_idx;
+  hdr.active_thread_is_channel = active_is_channel;
+  // The segmented msgs store doesn't carry the companion message counter —
+  // this (frequently-rewritten, small) file does instead.
+  hdr.msgcount              = msgcount;
+  if (f.write(reinterpret_cast<const uint8_t*>(&hdr), sizeof(hdr)) != sizeof(hdr)) {
+    f.close(); uiDataRemove(k_ui_threads_tmp_path); return false;
+  }
+  for (int i = 0; i < UITask::MAX_UI_THREADS; ++i) {
+    if (f.write(reinterpret_cast<const uint8_t*>(&threads[i]), sizeof(UiHistoryThread))
+        != sizeof(UiHistoryThread)) {
+      f.close(); uiDataRemove(k_ui_threads_tmp_path); return false;
+    }
+  }
+  f.close();
+  // Commit the tmp over the live file. The branch this writer came from wrote the
+  // real path directly and returned here; the trunk opens a tmp (see above), so
+  // without this rename every write would land in threads.bin.tmp and the live
+  // table would never change — a silent, total loss of thread metadata.
+  return uiDataReplaceFile(k_ui_threads_path, k_ui_threads_tmp_path);
+}
+
+// Worker entry: write the snapshot the loop armed. Never reads live UI state.
+static bool uiThreadsWorkerFlush() {
+  return uiWriteThreadsFile(s_threads_snap, s_threads_snap_active_idx,
+                            s_threads_snap_active_isch, s_threads_snap_msgcount);
+}
+#endif
+
+// #22: serialise the LIVE 48-slot thread table into on-disk records. Loop-thread
+// only, and the cheap half — no I/O; the file write is what gets offloaded to the
+// core-1 flush task. File-static (not a UITask member) on purpose: UiHistoryThread
+// lives in this .cpp's ANONYMOUS namespace, so it cannot be named from UITask.h —
+// declaring a member that takes it creates a second, distinct type and every
+// reference becomes ambiguous.
+static void serializeThreadsInto(UiHistoryThread* out, const UITask::UIThread* _ui_threads) {
+  for (int i = 0; i < UITask::MAX_UI_THREADS; ++i) {
+    UiHistoryThread& t = out[i];
+    memset(&t, 0, sizeof(t));
+    t.used               = _ui_threads[i].used ? 1u : 0u;
+    t.channel            = _ui_threads[i].channel ? 1u : 0u;
+    t.unread             = _ui_threads[i].unread;
+    t.last_ts            = _ui_threads[i].last_ts;
+    t.mesh_contact_idx   = _ui_threads[i].mesh_contact_idx;
+    memcpy(t.mesh_contact_pub,  _ui_threads[i].mesh_contact_pub,  sizeof(t.mesh_contact_pub));
+    memcpy(t.mesh_contact_key6, _ui_threads[i].mesh_contact_key6, sizeof(t.mesh_contact_key6));
+    t.mesh_channel_slot  = _ui_threads[i].mesh_channel_slot;
+    strncpy(t.name, _ui_threads[i].name, UITask::MAX_THREAD_NAME);
+    t.name[UITask::MAX_THREAD_NAME] = '\0';
+  }
+}
+
 bool UITask::saveThreadsToStorage() {
 #if defined(ESP32)
 #if defined(HAS_TDISPLAY_P4)
@@ -57852,44 +58173,35 @@ bool UITask::saveThreadsToStorage() {
     return a.ok;
   }
 #endif
-  WdtHeavyGuard _wg;
-  // Write to the tmp, commit with rename: a power cut mid-write leaves the old
-  // index intact instead of a short file the next boot would quarantine.
-  File f = uiDataOpen(k_ui_threads_tmp_path, "w");
-  if (!f) return false;
-
-  UiHistoryHeader hdr{};
-  hdr.magic                 = k_ui_threads_magic;
-  hdr.version               = k_ui_history_version;
-  hdr.thread_rec_size       = static_cast<uint16_t>(sizeof(UiHistoryThread));
-  hdr.active_thread_idx     = static_cast<int16_t>(_active_thread_idx);
-  hdr.active_thread_is_channel = _active_thread_is_channel ? 1u : 0u;
-  // The segmented msgs store doesn't carry the companion message counter —
-  // this (frequently-rewritten, small) file does instead.
-  hdr.msgcount              = static_cast<uint32_t>(_msgcount);
-  if (f.write(reinterpret_cast<const uint8_t*>(&hdr), sizeof(hdr)) != sizeof(hdr)) {
-    f.close(); uiDataRemove(k_ui_threads_tmp_path); return false;
+  // Synchronous write of the LIVE table — shutdown/reboot only; the periodic
+  // flush goes through the worker snapshot (mirrors saveMsgsToStorage).
+  //
+  // #31: wait for IDLE, not merely "not busy". The old check watched only the busy
+  // flag, so a request that was ARMED but not yet picked up read as idle — this
+  // path then overwrote s_threads_snap and wrote the file while the worker woke and
+  // wrote THE SAME FILE FROM THE SAME BUFFER. Two concurrent writers, one path.
+  // IDLE is the only state in which neither is true.
+  //
+  // The bound now exceeds the measured worst-case write (1.1-2.7 s, #22); the old
+  // ~1 s bound could not even cover it. On expiry we DO NOT WRITE: losing the last
+  // metadata delta costs a little unread/timestamp state, whereas writing anyway
+  // guarantees the concurrent-write corruption this wait exists to prevent, and a
+  // corrupt threads.bin loses the whole table on next boot. Fail loud (SAFELANE §6)
+  // rather than silently racing.
+  for (int i = 0; i < 700 && s_threads_flush_state.load(std::memory_order_acquire)
+                             != THREADS_FLUSH_IDLE; ++i) {
+    delay(5);
   }
-
-  UiHistoryThread t{};
-  for (int i = 0; i < MAX_UI_THREADS; ++i) {
-    memset(&t, 0, sizeof(t));
-    t.used               = _ui_threads[i].used ? 1u : 0u;
-    t.channel            = _ui_threads[i].channel ? 1u : 0u;
-    t.unread             = _ui_threads[i].unread;
-    t.last_ts            = _ui_threads[i].last_ts;
-    t.mesh_contact_idx   = _ui_threads[i].mesh_contact_idx;
-    memcpy(t.mesh_contact_pub,  _ui_threads[i].mesh_contact_pub,  sizeof(t.mesh_contact_pub));
-    memcpy(t.mesh_contact_key6, _ui_threads[i].mesh_contact_key6, sizeof(t.mesh_contact_key6));
-    t.mesh_channel_slot  = _ui_threads[i].mesh_channel_slot;
-    strncpy(t.name, _ui_threads[i].name, MAX_THREAD_NAME);
-    t.name[MAX_THREAD_NAME] = '\0';
-    if (f.write(reinterpret_cast<const uint8_t*>(&t), sizeof(t)) != sizeof(t)) {
-      f.close(); uiDataRemove(k_ui_threads_tmp_path); return false;
-    }
+  if (s_threads_flush_state.load(std::memory_order_acquire) != THREADS_FLUSH_IDLE) {
+    MESH_DEBUG_PRINTLN("saveThreadsToStorage: worker still writing after 3.5s - "
+                       "skipping sync write to avoid concurrent access (#31)");
+    return false;
   }
-  f.close();
-  return uiDataReplaceFile(k_ui_threads_path, k_ui_threads_tmp_path);
+  serializeThreadsInto(s_threads_snap, _ui_threads);
+  return uiWriteThreadsFile(s_threads_snap,
+                            static_cast<int16_t>(_active_thread_idx),
+                            _active_thread_is_channel ? 1u : 0u,
+                            static_cast<uint32_t>(_msgcount));
 #else
   return false;
 #endif
@@ -58838,6 +59150,27 @@ void UITask::refreshThreadsFromMesh() {
       _ui_threads[t].mesh_channel_slot = static_cast<int16_t>(i);
     }
   }
+  // #50: prune ghost channel threads. A channel thread whose name matches NO live
+  // mesh channel (e.g. its slot was overwritten by a colliding client SET_CHANNEL
+  // before that was made collision-safe, or the channel was removed) must not
+  // linger — it shows in the list but fails with "Channel not found" on send
+  // (syncThreadMeshSlots can't resolve it). Drop it so the list reflects reality.
+  // Never wipe the active thread (mirrors the DM-prune exception above): the user
+  // may have it open and be composing.
+  for (int t = 0; t < MAX_UI_THREADS; ++t) {
+    if (!_ui_threads[t].used || !_ui_threads[t].channel) continue;
+    if (t == _active_thread_idx) continue;
+    bool live = false;
+    for (int i = 0; i < MAX_GROUP_CHANNELS; ++i) {
+      if (the_mesh.getChannel(i, cd) && cd.name[0] &&
+          strncmp(cd.name, _ui_threads[t].name, MAX_THREAD_NAME) == 0) { live = true; break; }
+    }
+    if (!live) {
+      _ui_threads[t].used = false;
+      _ui_threads[t].name[0] = '\0';
+      _ui_threads[t].mesh_channel_slot = -1;
+    }
+  }
 #endif
 }
 
@@ -59244,6 +59577,10 @@ bool UITask::sendComposerToActiveThread(const char* override_text) {
     }
     appendMessage(_ui_threads[_active_thread_idx].name, sender, truncated, true, true, false,
                   0, DELIV_NONE, 0, 0, 0, 0, nullptr, 0, the_mesh.uiLastSentFp());
+    // #50 part B: mirror this device-composed channel message into the companion sync
+    // stream so a connected client shows it (as outgoing) instead of never seeing
+    // device-typed messages. No-op when no client is connected.
+    the_mesh.queueOutgoingChannelMessage(static_cast<uint8_t>(slot), ts, truncated);
     if (!override_text) resetComposer();   // a resend must not wipe a half-typed draft
     showAlert(TR("Sent"), 900);
     return true;
@@ -59335,6 +59672,9 @@ bool UITask::sendComposerToActiveThread(const char* override_text) {
   the_mesh.uiRegisterExpectedAck(expected_ack, recipient.id.pub_key);
   appendMessage(_ui_threads[_active_thread_idx].name, sender, truncated, false, true, false,
                 expected_ack, DELIV_SENT, 0, 0, 0, 0, nullptr, 0, the_mesh.uiLastSentFp());
+  // #50 part B: mirror this device-composed DM into the companion sync stream so a
+  // connected client shows it (as outgoing) under this recipient's thread.
+  the_mesh.queueOutgoingContactMessage(recipient.id.pub_key, ts, truncated);
   if (!override_text) resetComposer();   // a resend must not wipe a half-typed draft
   showAlert(TR("Sent"), 900);
   return true;
@@ -59620,6 +59960,31 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   // SD card ROOT /tiles so Wi-Fi tiles still cache + display instead of failing
   // with "Map storage error". s_tiles_fs_ready then means "a tile cache
   // (partition OR SD) is available".
+#if defined(HAS_CROWPANEL7)
+  // #36: PREFER the microSD over the (present) flash "tiles" partition. This is the
+  // opposite posture from the T-Deck/Tanmatsu arms below, which only fall back to SD
+  // when NO partition exists — here the flash partition mounts fine, but every tile
+  // WRITE to it disables the shared flash/PSRAM cache and whitens the DSI panel
+  // (#20/#36, confirmed on device: one flash per tile downloaded). SD_MMC writes go
+  // through a separate controller that never touches the flash cache, so routing the
+  // tile cache to the card removes the flashing at its source.
+  //
+  // REUSE the mount offband::sdLogBegin() already made at boot — it runs BEFORE
+  // display.begin() with setPowerChannel(-1), so it holds VO4 without re-acquiring
+  // the on-chip LDO (SdLog.cpp, #25). We must NOT call SD_MMC.begin()/.end() here: a
+  // second begin() would re-run the power-channel acquire and can brick the panel.
+  // Just point at the live &SD_MMC. Root '' -> tiles land at /tiles/<z>/<x>/<y>.jpg,
+  // which the driver maps under the /sdcard mount (same shape as the SD arms below).
+  if (offband::sdLogAvailable()) {
+    s_tile_fs = &SD_MMC;
+    s_tile_root[0] = '\0';
+    s_tiles_fs_ready = true;
+    WIRE_DBG("[TILE] CrowPanel7: caching Wi-Fi tiles on microSD /tiles (SD_MMC, reusing sdLog mount) — no flash writes");
+  }
+  // No card -> fall through to the flash partition. It WILL flash the panel on
+  // writes (#36), but with no card there is no alternative; degrade honestly.
+  else
+#endif
   if (s_tiles_fs_ready) {
     s_tile_fs = &s_tiles_fs;
     s_tile_root[0] = '\0';
@@ -59962,6 +60327,15 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
       const size_t buf_bytes = sizeof(lv_color_t) * g_draw_buf_px;
       g_draw_buffer = (lv_color_t*)heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
       if (!g_draw_buffer) g_draw_buffer = (lv_color_t*)malloc(buf_bytes);
+#elif defined(HAS_CROWPANEL7)
+      // P4 + native 1024x600, no rotation. Full-WIDTH band (1024 px) so each
+      // flushed area is a complete row-run. 32MB PSRAM is abundant and the
+      // MIPI-DSI DMA2D flush reads PSRAM fine (same rationale as Tanmatsu);
+      // internal DRAM stays free for WiFi/hosted DMA.
+      g_draw_buf_px = 1024 * LV_DRAW_BUF_LINES;
+      const size_t buf_bytes = sizeof(lv_color_t) * g_draw_buf_px;
+      g_draw_buffer = (lv_color_t*)heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (!g_draw_buffer) g_draw_buffer = (lv_color_t*)malloc(buf_bytes);
 #elif defined(HAS_TDISPLAY_P4)
       // P4: LVGL renders at half res (upscaled 2x on flush) — full-width band in the abundant 32MB PSRAM.
       // AMOLED (RM69A10) = 284-wide; TFT-LCD (HI8561) = 270-wide.
@@ -60172,6 +60546,15 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
     // stays == the panel width, so it's never entered).
     g_lv.disp_drv.hor_res  = TAN_PANEL_PW;   // 480
     g_lv.disp_drv.ver_res  = TAN_PANEL_PH;   // 800
+#elif defined(HAS_CROWPANEL7)
+    // EK79007 MIPI-DSI is NATIVE landscape 1024x600 — no rotation of any kind
+    // (hardware MADCTL or LVGL software). Register the panel's real size so
+    // every lv_disp_get_hor/ver_res() layout query in this file sees the whole
+    // surface. Without this branch the #else fallback below hardcodes the S3
+    // TFT's 320x240 and the entire UI renders into 76,800 of the panel's
+    // 614,400 px — exactly 1/8 of the screen (owner-observed, #7).
+    g_lv.disp_drv.hor_res  = 1024;
+    g_lv.disp_drv.ver_res  = 600;
 #elif defined(HAS_TDISPLAY_P4)
     // Render at HALF the native panel; the P4 DisplayDriver upscales 2x on flush, so the whole UI is
     // uniformly 2x bigger on the high-DPI panel (simpler than per-element scaling). The touch driver
@@ -62985,7 +63368,14 @@ void UITask::loop() {
   { static unsigned long s_floor_due = 0;
     if (now >= s_floor_due) {
       s_floor_due = now + 15UL * 60UL * 1000UL;
-      touchPrefsSetClockFloor(rtc_clock.getFloor());   // no-op unless it grew
+      // #20 INSTRUMENTATION (diagnostic only): mark the 15-min tick so serial shows
+      // tick-vs-actual-write. The "no-op unless it grew" comment below is
+      // misleading — ClockFloorRTC::getCurrentTime() ratchets _floor to wall clock
+      // on every call, so the floor DOES grow and this normally does write. A
+      // [PREFSW] line right after this tick = an internal-flash write = a panel flash.
+      const uint32_t _cf = rtc_clock.getFloor();
+      Serial.printf("[FLOORTICK] floor=%lu @%lu\n", (unsigned long)_cf, (unsigned long)now);
+      touchPrefsSetClockFloor(_cf);   // writes only when the floor actually grew
     } }
 #endif
 #if defined(DOC_CAPTURE)
