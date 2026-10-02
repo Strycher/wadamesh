@@ -10,6 +10,18 @@
 #include <SD_MMC.h>
 #endif
 
+// #53/§6: surface DataStore persistence outcomes to the card log so a failed SD
+// write can never be silent (saveChannels/saveContacts previously no-op'd on an
+// open failure). offband::sdLogf writes to /wadamesh.log on the TF card
+// (CrowPanel7); a no-op on other boards. Success lines are logged for now per the
+// #53 request — a candidate to move behind a verbose-debug pref later.
+#if defined(HAS_CROWPANEL7)
+  #include "helpers/offband/SdLog.h"
+  #define DS_PERSIST_LOG(...) offband::sdLogf(__VA_ARGS__)
+#else
+  #define DS_PERSIST_LOG(...) do {} while (0)
+#endif
+
 #if defined(EXTRAFS) || defined(QSPIFLASH)
   #define MAX_BLOBRECS 100
 #else
@@ -56,7 +68,16 @@ File DataStore::openWrite(FILESYSTEM* fs, const char* filename) {
 #elif defined(RP2040_PLATFORM)
   return fs->open(_rp(filename), "w");
 #else
-  return fs->open(_rp(filename), "w", true);
+  // #53: the 3-arg form asks the ESP32 VFS to create parent dirs. On SD_MMC (FAT)
+  // that step FAILS for a root-level file like /channels2 or /contacts3, so the
+  // open returned an invalid File and DataStore silently wrote nothing (confirmed
+  // on device via the card log). SPIFFS/LittleFS/FFat accept the 3-arg form, so
+  // keep it as the primary attempt (no regression) and fall back to the plain
+  // 2-arg open — the same form the working tile-cache SD writes use — only when it
+  // fails. DataStore writes are all root-level, so no parent dir is ever needed.
+  File f = fs->open(_rp(filename), "w", true);
+  if (!f) f = fs->open(_rp(filename), "w");
+  return f;
 #endif
 }
 
@@ -544,6 +565,11 @@ File file = openRead(_getContactsChannelsFS(), "/contacts3");
         if (!host->onContactLoaded(c)) full = true;
       }
       file.close();
+      DS_PERSIST_LOG("[DS] loadContacts: loaded %d contacts from /contacts3 (fs=%s)",
+                     loaded, _fsExtra ? "SD" : "primary");
+    } else {
+      DS_PERSIST_LOG("[DS] loadContacts: /contacts3 absent / open failed (fs=%s)",
+                     _fsExtra ? "SD" : "primary");
     }
 }
 
@@ -791,6 +817,17 @@ void DataStore::saveContacts(DataStoreHost* host, bool (*filter)(const ContactIn
     }
     file.close();
     wrote_ok = ok;
+    // #53/§6 — no silent failures. Both outcomes are logged, because "nothing in
+    // the log" previously meant either "saved fine" or "lost the whole list", and
+    // there was no way to tell which.
+    if (!wrote_ok) DS_PERSIST_LOG("[DS] saveContacts: WRITE FAILED near contact %u (fs=%s)",
+                                  (unsigned)idx, _fsExtra ? "SD" : "primary");
+    else           DS_PERSIST_LOG("[DS] saveContacts: wrote %u contacts OK (fs=%s)",
+                                  (unsigned)idx, _fsExtra ? "SD" : "primary");
+  } else {
+    // #53/§6: a failed open here silently dropped the whole contact list. Surface it.
+    DS_PERSIST_LOG("[DS] saveContacts: openWrite(%s) FAILED (fs=%s) - contacts NOT saved",
+                   kContactsWriteTarget, _fsExtra ? "SD" : "primary");
   }
 #if defined(ESP32)
   // Commit the temp only if it was written IN FULL; otherwise keep the existing live list.
@@ -841,6 +878,11 @@ void DataStore::loadChannels(DataStoreHost* host) {
         }
       }
       file.close();
+      DS_PERSIST_LOG("[DS] loadChannels: loaded %u channels from /channels2 (fs=%s)",
+                     (unsigned)channel_idx, _fsExtra ? "SD" : "primary");
+    } else {
+      DS_PERSIST_LOG("[DS] loadChannels: /channels2 absent / open failed (fs=%s) - no channels restored",
+                     _fsExtra ? "SD" : "primary");
     }
 }
 
@@ -858,16 +900,26 @@ void DataStore::saveChannels(DataStoreHost* host) {
     ChannelDetails ch;
     uint8_t unused[4];
     memset(unused, 0, 4);
+    bool write_ok = true;
 
     while (host->getChannelForSave(channel_idx, ch)) {
       bool success = (file.write(unused, 4) == 4);
       success = success && (file.write((uint8_t *)ch.name, 32) == 32);
       success = success && (file.write((uint8_t *)ch.channel.secret, 32) == 32);
 
-      if (!success) break; // write failed
+      if (!success) { write_ok = false; break; } // write failed
       channel_idx++;
     }
     file.close();
+    if (!write_ok) DS_PERSIST_LOG("[DS] saveChannels: WRITE FAILED at channel %u (fs=%s)",
+                                  (unsigned)channel_idx, _fsExtra ? "SD" : "primary");
+    else           DS_PERSIST_LOG("[DS] saveChannels: wrote %u channels OK (fs=%s)",
+                                  (unsigned)channel_idx, _fsExtra ? "SD" : "primary");
+  } else {
+    // #53/§6: was a SILENT no-op — a failed open here is exactly how channels get
+    // lost with no trace. Surface it (which storage backend, so we know SD vs primary).
+    DS_PERSIST_LOG("[DS] saveChannels: openWrite(/channels2) FAILED (fs=%s) - channels NOT saved",
+                   _fsExtra ? "SD" : "primary");
   }
 }
 
