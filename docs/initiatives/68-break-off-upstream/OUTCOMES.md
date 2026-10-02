@@ -82,7 +82,7 @@ automation account's token scope (that endpoint returns 404 for it, which is a
 permissions boundary and not an absence of protection). Both were set and
 confirmed by the owner on 2026-09-30 and are recorded in the project notes.
 
-### 3. `beta_85` ancestry, and the delta property
+### 3. `beta_85` ancestry, and the delta property — the point of the Feature
 
 ```
 commits in beta_85 not in main      0
@@ -102,19 +102,41 @@ total history in beta_85   1,180 commits
 
 So a take is tens of commits, not a four-figure replay.
 
-**This is the one property that is NOT fully demonstrated, and it is the one the
-Feature exists to establish.** `beta_85` is the newest upstream tag in this
-clone, and there is no `upstream` remote — it was removed on leaving the fork
-network. A genuine dry run needs a tag that postdates `beta_85`, fetched from the
-upstream repository, and contacting upstream is an owner-approval action under
-this project's own rules. The property is therefore shown **by construction from
-the commit graph** and not yet **exercised against a real later tag**.
+**Demonstrated against live upstream content**, with the owner's approval, on
+2026-10-02. Upstream is `ALLFATHER-BV/wadamesh`; no remote was added and nothing
+was merged — a read-only fetch into a temporary ref, a non-destructive
+`git merge-tree`, then the ref deleted.
 
-What would close it, when the owner chooses to: fetch a tag past `beta_85`
-read-only, then on a throwaway branch off `main` run a no-commit merge of it and
-record the commit count and diffstat. Expected result is a delta on the order of
-the `beta_84 -> beta_85` figures above. Until that is run, treat the delta
-property as reasoned rather than proven.
+First, the take was faithful. Our tag and upstream's are the same object:
+
+```
+our      beta_85   df99548a10377fd7eca81ae80d200f91591e3cc6
+upstream beta_85   df99548a10377fd7eca81ae80d200f91591e3cc6
+```
+
+`beta_85` is still upstream's newest tag, so the test ran against upstream's
+current `main`, which has moved past it:
+
+```
+merge-base(main, upstream/main)   df99548a  == beta_85 exactly
+commits a take would bring        1
+                                  c9ecaf3 "reports: say how long they ran it,
+                                           not just a span"
+diffstat                          2 files, +6 / -3
+                                  deploy/report-service.py, deploy/site/beta.html
+commits we have that upstream does not   6
+dry-run merge (git merge-tree)    CLEAN — exit 0, no conflicts, tree 90e7e0a3
+```
+
+**The merge base is precisely the tag we took.** That is the whole property, and
+it is now a measured fact rather than an inference: a take brings only what
+upstream added after `beta_85`, it applies without conflict, and it does not
+disturb the six commits of our own that upstream has never seen.
+
+One honest caveat on the size: the delta happens to be a single commit because
+upstream has pushed little since `beta_85` (last push 2026-09-23). The figure to
+plan against is the `beta_84 -> beta_85` shape above — tens of commits — not this
+one. What the test establishes is the *mechanism*, not a forecast of volume.
 
 ### 4. `git log --first-parent main`
 
@@ -163,14 +185,15 @@ every hunk to be read against the new trunk:
 
 ## What is left
 
-**Needs an owner decision:**
+**Settled by the owner, 2026-10-02:**
 
-- `scripts/release.sh` gained a `wadamesh-crowpanel7` ENVS entry, because the
-  `WADA_BOARD_ID` guard requires the board-id table and the release list to stay
-  in sync. A manual `release.sh` run would therefore publish an artifact for a
-  board that has never been flash-verified. CI is unaffected. Removing the line
-  is a one-liner if the board should stay build-only until it is verified.
-- Whether to run the real upstream dry run described in §3.
+- CrowPanel7 **stays in the build matrix**, and therefore keeps its
+  `wadamesh-crowpanel7` entry in `scripts/release.sh` — the `WADA_BOARD_ID`
+  guard requires the board-id table and the release list to move together. A
+  manual `release.sh` run will publish an artifact for a board that has not yet
+  been flash-verified; that is accepted, and nothing publishes without someone
+  cutting a tag and running the script.
+- The upstream dry run was approved and run. Result in §3.
 
 **Deferred, with issues:**
 
