@@ -35,6 +35,13 @@ jobs:
           - rak_tap_v2_companion_radio_touch
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history + tags. scripts/inject_version.py derives the version from a
+          # commit count and from `git describe --match beta_*`, and both are wrong on
+          # the fetch-depth-1 clone this action gives by default. The script will
+          # deepen a shallow clone itself, but doing it here is one fetch at checkout
+          # instead of one per env mid-build.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
