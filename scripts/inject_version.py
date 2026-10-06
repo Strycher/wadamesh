@@ -47,9 +47,24 @@ def _git(*args):
     return r.stdout.strip()
 
 
-# A shallow clone makes `rev-list --count` wrong -> a lying version. Refuse to build.
+# A shallow clone makes `rev-list --count` wrong -> a lying version. Deepen it if we
+# can, and refuse to build if we cannot — never emit a count from truncated history.
+#
+# This is not hypothetical: actions/checkout@v4 defaults to fetch-depth 1, so EVERY
+# CI and release build arrives shallow. Fixing it here rather than in the workflows
+# covers both ci.yml and release.yml, and avoids editing release.yml, which is
+# upstream's file and would conflict on every future upstream take.
 if _git("rev-parse", "--is-shallow-repository") == "true":
-    _die("shallow clone: commit count would be wrong. Run: git fetch --unshallow --tags")
+    print("[offband-patch] shallow clone detected — deepening (git fetch --unshallow --tags)")
+    try:
+        _r = subprocess.run(["git", "fetch", "--unshallow", "--tags"],
+                            capture_output=True, text=True, check=False)
+    except (subprocess.SubprocessError, FileNotFoundError) as _e:
+        _die(f"shallow clone and `git fetch --unshallow` could not run ({_e}); "
+             "commit count would be wrong.")
+    if _r.returncode != 0 or _git("rev-parse", "--is-shallow-repository") == "true":
+        _die("shallow clone and `git fetch --unshallow --tags` did not deepen it "
+             f"(rc={_r.returncode}: {_r.stderr.strip()}); commit count would be wrong.")
 
 # Nearest beta_* tag reachable from HEAD = the wadamesh base we branched off.
 base_tag = _git("describe", "--tags", "--abbrev=0", "--match", "beta_*")
