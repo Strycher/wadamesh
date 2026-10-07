@@ -42,6 +42,10 @@ jobs:
           # deepen a shallow clone itself, but doing it here is one fetch at checkout
           # instead of one per env mid-build.
           fetch-depth: 0
+          # fetch-depth 0 alone was not enough (#92): a run arrived with beta_44 as
+          # the newest tag present and stamped beta_44+ob.871, where the same commit
+          # gives beta_85+ob.11 locally. Ask for tags explicitly.
+          fetch-tags: true
 
       - uses: actions/setup-python@v5
         with:
@@ -56,7 +60,16 @@ jobs:
           key: pio-ci-${{ runner.os }}-${{ matrix.pio_env }}-${{ hashFiles('platformio.ini') }}
 
       - name: Install PlatformIO
-        run: pip install --upgrade platformio
+        # PINNED, not --upgrade (#93). An unpinned core is what broke the crowpanel7
+        # env: the newest core requires `tool-scons ~4.41101.0` and installs it over
+        # the 4.8.1 that pioarduino's platform pins, and SCons 4.11 removed
+        # SCons.Tool.FortranCommon, which the espidf builder imports. The job
+        # compiled the whole tree and then died at link with ModuleNotFoundError.
+        #
+        # 6.1.19 is the version the boards are actually developed against, so this
+        # makes CI reproduce the developer machine instead of drifting ahead of it.
+        # Bump it deliberately, with a green matrix, never incidentally.
+        run: pip install platformio==6.1.19
 
       - name: Build ${{ matrix.pio_env }}
         run: pio run -e ${{ matrix.pio_env }}

@@ -70,6 +70,97 @@ if _git("rev-parse", "--is-shallow-repository") == "true":
 base_tag = _git("describe", "--tags", "--abbrev=0", "--match", "beta_*")
 if not base_tag.startswith("beta_"):
     _die(f"no reachable beta_* tag (got '{base_tag}'); fetch tags: git fetch --tags")
+
+# Cross-check describe against the newest beta_* tag that is actually an ancestor.
+#
+# WHY (#92): the shallow guard above only catches truncated HISTORY. CI hit a case
+# where the history was complete but the TAG SET was not, and `describe` happily
+# answered with an older tag — beta_44+ob.871 in CI against beta_85+ob.11 locally,
+# from the same commit. Nothing failed; the build just stamped a version naming the
+# wrong upstream base. That is the exact outcome `_die` exists to prevent, one level
+# down from the case it was written for: not "we cannot determine the version" but
+# "we determined it wrongly and said nothing".
+#
+# `describe` picks the nearest tag by graph distance. On a straight trunk that is
+# also the newest, so the two agree; when they disagree, either the tag set is
+# incomplete or the graph is stranger than we think, and both are worth stopping for.
+_tags = [t for t in _git("tag", "--list", "beta_*").splitlines() if t.strip()]
+_ancestors = [t for t in _tags
+              if subprocess.run(["git", "merge-base", "--is-ancestor", t, "HEAD"],
+                                capture_output=True, check=False).returncode == 0]
+if _ancestors:
+    def _tagkey(t):
+        # beta_9 must sort below beta_85, so compare numerically, not as strings.
+        _n = t[len("beta_"):]
+        return (0, int(_n)) if _n.isdigit() else (1, 0)
+    _newest = max(_ancestors, key=_tagkey)
+    if _newest != base_tag:
+        _die(
+            f"version base is ambiguous: `git describe` says '{base_tag}' but the newest "
+            f"beta_* tag that is an ancestor of HEAD is '{_newest}'.\n"
+            f"  beta_* tags present: {len(_tags)}; of those, ancestors of HEAD: {len(_ancestors)}\n"
+            f"  describe would stamp: {base_tag}+ob."
+            f"{_git('rev-list', '--count', f'{base_tag}..HEAD')}\n"
+            f"  newest ancestor says: {_newest}+ob."
+            f"{_git('rev-list', '--count', f'{_newest}..HEAD')}\n"
+            "Usually an incomplete tag fetch. Try: git fetch --tags --force"
+        )
+
+# The check above compares describe against the tags we HAVE. It cannot catch the
+# case that actually bit CI (#92): the newest tag missing from the clone entirely,
+# so that the newest tag we have and describe's answer agree — on beta_44 — and
+# nothing looks wrong. Only the remote knows what we should have.
+#
+# One `ls-remote` per build, and it is advisory about the network but strict about
+# the answer: an unreachable remote passes with a warning (offline builds are
+# legitimate), a reachable remote that lists a newer beta_* tag than our newest
+# ancestor FAILS. The point is that "I could not check" and "I checked and it is
+# wrong" must not look the same, which is the mistake this whole guard exists to
+# stop repeating.
+try:
+    _ls = subprocess.run(["git", "ls-remote", "--tags", "origin", "refs/tags/beta_*"],
+                         capture_output=True, text=True, check=False, timeout=30)
+except (subprocess.SubprocessError, FileNotFoundError, OSError) as _e:
+    _ls = None
+    sys.stderr.write(f"[offband-patch] WARNING: could not list remote tags ({_e}); "
+                     f"version base '{base_tag}' not cross-checked against origin.\n")
+if _ls is not None and _ls.returncode != 0:
+    sys.stderr.write("[offband-patch] WARNING: `git ls-remote` failed "
+                     f"(rc={_ls.returncode}: {_ls.stderr.strip()[:120]}); "
+                     f"version base '{base_tag}' not cross-checked against origin.\n")
+elif _ls is not None:
+    _remote = []
+    for _line in _ls.stdout.splitlines():
+        _parts = _line.split("refs/tags/")
+        if len(_parts) == 2 and not _parts[1].endswith("^{}"):
+            _remote.append(_parts[1].strip())
+    # Only tags we could actually be based on: those that are ancestors here. A tag
+    # we do not have cannot be tested for ancestry, so missing-and-newer is the
+    # signal, and `base_tag` is our floor for "newer".
+    _base_n = base_tag[len("beta_"):]
+    if _base_n.isdigit():
+        _newer_missing = sorted(
+            (t for t in _remote
+             if t[len("beta_"):].isdigit()
+             and int(t[len("beta_"):]) > int(_base_n)
+             and t not in _tags),
+            key=lambda t: int(t[len("beta_"):]),
+        )
+        # Newer tags that we DO have but that are not ancestors are fine and expected
+        # (upstream moved on; we have not taken it yet). Only a tag we are missing
+        # outright means the clone cannot answer the question it was just asked.
+        if _newer_missing:
+            _die(
+                f"incomplete tag set: origin has {len(_newer_missing)} beta_* tag(s) newer "
+                f"than '{base_tag}' that this clone does not have "
+                f"({', '.join(_newer_missing[:5])}"
+                f"{', ...' if len(_newer_missing) > 5 else ''}).\n"
+                f"  local beta_* tags: {len(_tags)}; origin: {len(_remote)}\n"
+                f"  so '{base_tag}+ob."
+                f"{_git('rev-list', '--count', f'{base_tag}..HEAD')}' may name the wrong base.\n"
+                "Fetch the tags and rebuild: git fetch --tags --force\n"
+                "In GitHub Actions, set `fetch-tags: true` on actions/checkout."
+            )
 # Commits on this branch since that base tag (0 right after branching).
 count = _git("rev-list", "--count", f"{base_tag}..HEAD")
 sha = _git("rev-parse", "--short=7", "HEAD")
