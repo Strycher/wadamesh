@@ -85,9 +85,28 @@ if not base_tag.startswith("beta_"):
 # also the newest, so the two agree; when they disagree, either the tag set is
 # incomplete or the graph is stranger than we think, and both are worth stopping for.
 _tags = [t for t in _git("tag", "--list", "beta_*").splitlines() if t.strip()]
-_ancestors = [t for t in _tags
-              if subprocess.run(["git", "merge-base", "--is-ancestor", t, "HEAD"],
-                                capture_output=True, check=False).returncode == 0]
+# `merge-base --is-ancestor` exits 0 for yes and 1 for no. ANY other code is an
+# error — a missing object, an unreadable repo — and must not be read as "no".
+# Collapsing error into no is what let the first version of this guard pass
+# silently in CI, which is the same mistake it was written to catch.
+_ancestors, _undecidable = [], []
+for _t in _tags:
+    _rc = subprocess.run(["git", "merge-base", "--is-ancestor", _t, "HEAD"],
+                         capture_output=True, text=True, check=False)
+    if _rc.returncode == 0:
+        _ancestors.append(_t)
+    elif _rc.returncode != 1:
+        _undecidable.append(f"{_t}(rc={_rc.returncode} {_rc.stderr.strip()[:60]})")
+if _undecidable:
+    _die("cannot decide tag ancestry, so the version base cannot be trusted: "
+         f"{', '.join(_undecidable[:5])}"
+         f"{', ...' if len(_undecidable) > 5 else ''}")
+
+# Always say what we concluded. A guard whose success is silent cannot be
+# debugged from a build log, and this one needed debugging from a build log.
+print(f"[offband-patch] version base: describe={base_tag}; "
+      f"beta_* tags local={len(_tags)} ancestors={len(_ancestors)}")
+
 if _ancestors:
     def _tagkey(t):
         # beta_9 must sort below beta_85, so compare numerically, not as strings.
